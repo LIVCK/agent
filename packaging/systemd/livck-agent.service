@@ -1,0 +1,118 @@
+# LIVCK Server Monitoring Agent - systemd unit.
+#
+# This unit is the canonical delivery artifact for the agent, and is ASCII-only.
+# Every directive carries a short rationale so the trade-offs are reviewable.
+# systemd does not support trailing comments on the same line as a directive, so
+# all notes are on their own lines.
+#
+# Guiding constraint: the agent must read HOST-WIDE /proc, /sys and real mounts
+# (statfs/mountinfo) and make outbound HTTPS only. The hardening below is as
+# tight as possible WITHOUT hiding host state from the collectors.
+
+[Unit]
+Description=LIVCK Server Monitoring Agent
+Documentation=https://get.livck.cloud
+# Wait for the network and a synced clock: enroll needs DNS + TLS, and skewed
+# timestamps would poison the metric series.
+After=network-online.target time-sync.target
+Wants=network-online.target
+# Never rate-limit restarts: an outbound-only agent must be able to restart
+# unboundedly (paired with Restart=always) so a flaky network cannot wedge it.
+StartLimitIntervalSec=0
+
+[Service]
+# simple, NOT notify: the agent never calls sd_notify(), so Type=notify would
+# never report "ready" and would crash-loop. Outbound-only needs no readiness
+# signal, so no watchdog is configured either.
+Type=simple
+ExecStart=/usr/bin/livck-agent run
+# Always restart with a short backoff; combined with StartLimitIntervalSec=0
+# this makes the service infinitely restartable.
+Restart=always
+RestartSec=2s
+# Dedicated, PERSISTENT system user (created by the package postinstall). NOT
+# DynamicUser: the managed token lives 0600 in the StateDirectory and must stay
+# readable across restarts under a stable UID (a rotating DynamicUser UID would
+# orphan the persisted identity).
+User=livck-agent
+# systemd creates/owns /var/lib/livck-agent (0700, User=livck-agent) and exports
+# STATE_DIRECTORY, which the agent reads to locate its identity/token/spool.
+StateDirectory=livck-agent
+StateDirectoryMode=0700
+# Optional proxy env (HTTPS_PROXY/HTTP_PROXY/NO_PROXY) for DACH corporate
+# networks. Leading '-' makes the file optional (absent => no error).
+EnvironmentFile=-/etc/livck-agent/agent.env
+# GC soft cap on the Go heap; keeps steady-state RSS bounded (<30 MB budget).
+Environment=GOMEMLIMIT=48MiB
+# Hard cgroup backstop above the soft heap limit: the kernel OOM-kills the
+# service before it can threaten the host (GOMEMLIMIT alone only bounds the heap).
+MemoryMax=64M
+# Pin GOMAXPROCS so the Go runtime does NOT scale its scheduler threads, GC
+# workers and per-P caches to the host core count. A sampler must have the SAME
+# tiny footprint on a 128-core / 4 TB host as on a 2-core VM. The agent also
+# enforces this in-process (covers Docker / manual runs), but pinning it here
+# keeps it visible and authoritative for the packaged service.
+Environment=GOMAXPROCS=2
+# Hard CPU ceiling: at most ~40% of ONE core, no matter how many cores the host
+# has (so a big box never sees the agent take "a few percent" of its total). Far
+# above the <1% steady state; only clips a pathological runaway. CPUWeight below
+# handles fair-share under contention; this is the absolute cap.
+CPUQuota=40%
+
+# ---- Hardening ---------------------------------------------------------------
+# Mount everything read-only except a few runtime paths; the agent writes only
+# to its StateDirectory. strict is the strongest ProtectSystem tier.
+ProtectSystem=strict
+# read-only (NOT yes): 'yes' masks /home and /root as empty, which would hide a
+# separate /home partition from the disk collector. read-only keeps them visible
+# but unwritable.
+ProtectHome=read-only
+# no (NOT yes): a private /tmp namespace would give the agent its OWN mount view,
+# so statfs()/mountinfo would not see the real host mounts it must report on.
+PrivateTmp=no
+# The agent never needs elevated privileges; block acquiring any via setuid/etc.
+NoNewPrivileges=yes
+# Drop ALL capabilities: pure userspace /proc + /sys reads and one outbound
+# socket need none.
+CapabilityBoundingSet=
+# Ignore any stray SUID/SGID bits.
+RestrictSUIDSGID=yes
+# No realtime scheduling; the agent is a low-priority sampler.
+RestrictRealtime=yes
+# Deny creating new namespaces (defense in depth against sandbox escapes).
+RestrictNamespaces=yes
+# Only the socket families the agent uses: INET/INET6 for HTTPS (incl. the proxy
+# connect), UNIX for local IPC (e.g. resolver), NETLINK for kernel stat queries.
+# Everything else (e.g. AF_PACKET) is blocked.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Freeze the execution-domain "personality" (blocks a class of legacy exploits).
+LockPersonality=yes
+# W^X: no page may be both writable and executable. Safe because the binary is
+# CGO_ENABLED=0 static Go (no JIT, no dlopen).
+MemoryDenyWriteExecute=yes
+# Read-only /proc/sys, /sys and friends: the agent reads kernel state, never
+# tunes it.
+ProtectKernelTunables=yes
+# Block (un)loading kernel modules.
+ProtectKernelModules=yes
+# Read-only cgroup hierarchy.
+ProtectControlGroups=yes
+# Allowlist syscalls to the "system service" set. This intentionally still
+# permits open/read/statfs/socket so the collectors and sender keep working.
+SystemCallFilter=@system-service
+# Restrict syscalls to the native ABI (blocks x32/compat shims).
+SystemCallArchitectures=native
+# Low CPU weight: the agent yields to real workloads under contention.
+CPUWeight=20
+#
+# Deliberately NOT set, and why:
+#   ProtectProc / ProcSubset  - the collectors scan host-wide /proc (procs, OOM
+#                               counters, PSI). Restricting /proc would blind them.
+#   PrivateDevices            - would hide /dev/nvidia* etc. from the (opt-in) GPU
+#                               collector. GPU sampling is opt-in, so /dev stays.
+#   DynamicUser               - see User= above (persistent token custody).
+#   IPAddressAllow/Deny       - egress is user/proxy-controlled; the agent must
+#                               reach arbitrary ingest/proxy IPs.
+
+[Install]
+WantedBy=multi-user.target

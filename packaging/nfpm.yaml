@@ -1,0 +1,83 @@
+# nfpm packaging spec for livck-agent - builds deb + rpm from ONE definition.
+#
+# Build-time tool only (nfpm is not an agent dependency). Invoked by the
+# Makefile `package` target once per (arch, packager):
+#
+#     ARCH=amd64 VERSION=1.2.3 nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+#     ARCH=arm64 VERSION=1.2.3 nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+#
+# ARCH is Go nomenclature (amd64|arm64); nfpm maps it to deb (amd64/arm64) and
+# rpm (x86_64/aarch64). The stripped, static binary must already exist at
+# dist/livck-agent_linux_${ARCH} (Makefile `dist` target builds it).
+#
+# All contents `src` paths are relative to nfpm's WORKING DIRECTORY, which must
+# be the repo root (the Makefile runs nfpm from there) - NOT relative to this
+# config file. ASCII only. No internal hosts, secrets, or paths.
+
+name: livck-agent
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+# Reset to 1 on every upstream version bump.
+release: "1"
+section: net
+priority: optional
+maintainer: LIVCK <support@livck.cloud>
+description: |
+  LIVCK Server Monitoring Agent.
+  Lightweight, outbound-only Linux agent that samples system metrics (CPU,
+  memory, load, disk, network, pressure) and reports lifecycle events to LIVCK
+  Cloud. No inbound port, no command channel, no local monitoring logic.
+vendor: LIVCK
+homepage: https://get.livck.cloud
+license: MIT
+
+# The agent is systemd-only; require the init system.
+depends:
+  - systemd
+
+# Marks this package as the canonical provider of the livck-agent command.
+# There is no predecessor package, so replaces/conflicts are intentionally empty.
+provides:
+  - livck-agent
+
+contents:
+  # Static, stripped agent binary. nfpm does NOT expand env vars inside
+  # contents.src, so the Makefile stages the correct per-arch binary at this
+  # fixed path before each nfpm invocation.
+  - src: dist/livck-agent.pkgbin
+    dst: /usr/bin/livck-agent
+    file_info:
+      mode: 0755
+
+  # systemd unit. /usr/lib/systemd/system is the vendor unit dir on all target
+  # distros (Ubuntu 22.04/24.04, Debian 12, RHEL 9 are all usr-merged).
+  - src: packaging/systemd/livck-agent.service
+    dst: /usr/lib/systemd/system/livck-agent.service
+    file_info:
+      mode: 0644
+
+  # Config directory (owned so rpm cleans it up on erase).
+  - dst: /etc/livck-agent
+    type: dir
+    file_info:
+      mode: 0755
+
+  # Documented, inert env template. Real overrides live in agent.env (not shipped).
+  - src: packaging/agent.env.example
+    dst: /etc/livck-agent/agent.env.example
+    file_info:
+      mode: 0644
+
+  # License (Debian policy + rpm convention).
+  - src: LICENSE
+    dst: /usr/share/doc/livck-agent/LICENSE
+    file_info:
+      mode: 0644
+
+# Maintainer scripts. ONE script each, normalized to work under both dpkg and
+# rpm arg conventions (see the scripts themselves).
+scripts:
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh

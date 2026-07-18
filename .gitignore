@@ -1,0 +1,14 @@
+# Local dev workspace (see go.work header). The public repo resolves pkg/wire
+# through the go.mod replace directive; go.work is never committed.
+/go.work
+/go.work.sum
+
+# Build output.
+/livck-agent
+/livck-loadgen
+/dist/
+/coverage.out
+/coverage.html
+
+# Local agent state written during manual runs.
+/state/

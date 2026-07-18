@@ -1,0 +1,14 @@
+version: v2
+modules:
+  - path: .
+lint:
+  use:
+    - STANDARD
+  except:
+    # wire.proto lives at the module root (pkg/wire), not in a livck/wire/v1/
+    # directory. The flat layout is deliberate: this is a single-file wire
+    # contract, not a proto tree. Everything else in STANDARD stays on.
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - FILE

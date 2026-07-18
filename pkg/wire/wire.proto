@@ -1,0 +1,164 @@
+// LIVCK agent <-> pulse wire protocol, version 1.
+//
+// FROZEN. The first public commit of this file is the freeze point. Only
+// additive changes are allowed after that (new fields with new numbers, new
+// enum values). Never renumber, retype, or reuse a field number, and never
+// remove or repurpose a reserved range. A breaking change here silently breaks
+// production across two repos (agent + pulse). See CONTRACT.md, section
+// "When you must change this contract".
+//
+// Transport: POST /v1/ingest, Content-Type application/x-protobuf,
+// Content-Encoding zstd, Authorization: Bearer lvk_...
+
+syntax = "proto3";
+
+package livck.wire.v1;
+
+option go_package = "github.com/LIVCK/agent/pkg/wire;wire";
+
+// MetricBatch is one ingest request body: reports and/or events collected by an
+// agent, sent to pulse. A batch may carry only events (empty reports) or only
+// reports.
+message MetricBatch {
+  // Reserved for future label support on series identity. Do not assign without
+  // a dedicated design review: labels change series identity.
+  reserved 20 to 29;
+
+  // Wire schema version. Must be 1 in v1. 0 => 400 UNSUPPORTED_SCHEMA_VERSION.
+  // Deprecation band: pulse fully accepts {N, N-1}, accepts N-2..min_supported
+  // with a warning, rejects below min_supported with 400. min_supported is
+  // published in /v1/me and pulse config.
+  uint32 schema_version = 1;
+
+  // UUIDv4 batch idempotency key. Longer than 64 chars => 400
+  // IDEMPOTENCY_KEY_TOO_LONG. Not UUIDv4 form => 400 MALFORMED_BODY.
+  string idempotency_key = 2;
+
+  // Agent build version, e.g. "1.0.0".
+  string agent_version = 3;
+
+  // Agent instance UUID from the state directory. Also the clone signal: pulse
+  // compares it against the bound_instance_id in the token claims; a mismatch
+  // is 409 INSTANCE_CONFLICT. No separate wire field carries the binding.
+  string agent_instance_id = 4;
+
+  // Wall clock send time, milliseconds. Used only to measure skew. |skew| > 5
+  // min => 422 CLOCK_SKEW (batch is final; a 422 does not refresh liveness,
+  // only a 2xx does). Sample timestamps live on each Report, not here.
+  int64 sent_at_unix_ms = 5;
+
+  // Config version the agent currently has applied (echo). pulse piggybacks the
+  // authoritative version in the response so the agent knows to pull config.
+  uint32 applied_config_version = 6;
+
+  // Host fingerprint: machine_id_hash, boot_id, cloud_instance_id (optional),
+  // hostname. Sent on the first batch after start and whenever it changes.
+  map<string, string> fingerprint = 7;
+
+  // 1..200 reports. More than one is backfill. Server enforces caps.max_reports.
+  repeated Report reports = 8;
+
+  // 1..20 events, enforced server side (caps.max_events). Overflow is dropped
+  // item-wise with reason "event_budget", never a batch reject.
+  repeated Event events = 9;
+
+  // Empty for managed tokens (otherwise 400 SERVICE_ADDRESSING_FORBIDDEN).
+  // Required and claims-matched for user tokens; empty for a user
+  // token => 400 SERVICE_ADDRESSING_REQUIRED.
+  string service_public_id = 10;
+}
+
+// Report is one aggregation window of sys.* (and later custom.*) metrics.
+message Report {
+  // Reserved for future per-series labels. Freezing this range protects series
+  // identity; lifting it needs its own design review.
+  reserved 10 to 14;
+
+  // Wall clock at the END of the aggregation window, milliseconds. Sample time,
+  // never send time: retried batches must not collapse.
+  int64 sampled_at_unix_ms = 1;
+
+  // Metric values. sys.* keys are the fixed catalog in catalog.json; custom.*
+  // keys are rejected in v1. An empty map is allowed (event-carrier batch).
+  map<string, double> metrics = 2;
+
+  // Report-level metadata, flat. Sent on change and on the first report after
+  // start. Never carries ips_* (IP data is enroll-only). Optional key
+  // window_samples marks a partial window.
+  map<string, string> meta = 3;
+}
+
+// Event is a discrete lifecycle or health signal. Dedupe anchor is event_id;
+// pulse sets the dedupe key only after a successful produce (mark-after-deliver).
+message Event {
+  reserved 10 to 14;
+
+  // UUIDv4. Dedupe anchor.
+  string event_id = 1;
+
+  // Wall clock when the event occurred, milliseconds.
+  int64 occurred_at_unix_ms = 2;
+
+  // Event type. An unknown enum value is dropped by the server plus counted.
+  EventType type = 3;
+
+  // Type-validated metadata. reason, if present, is capped at 200 chars.
+  map<string, string> meta = 4;
+}
+
+// EventType is the closed event catalog. Adding a value is additive; removing or
+// renumbering is breaking. Value 0 is the proto3 default: an agent that sends a
+// type the server does not know maps to UNSPECIFIED and the event is dropped.
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+
+  // Agent installed / enrolled. meta: version.
+  EVENT_TYPE_INSTALL = 1;
+  EVENT_TYPE_ENROLL = 2;
+
+  // First run after a reboot. meta: boot_id, downtime_seconds (optional).
+  EVENT_TYPE_BOOT = 3;
+
+  // Dirty boot: new boot_id with no clean_shutdown before it. meta:
+  // downtime_seconds.
+  EVENT_TYPE_UNEXPECTED_REBOOT = 4;
+
+  // logind ScheduledShutdown change. meta: type (reboot/poweroff), at, reason.
+  EVENT_TYPE_REBOOT_SCHEDULED = 5;
+
+  // logind PrepareForShutdown plus delay-inhibitor lock. meta: type, reason
+  // (optional).
+  EVENT_TYPE_CLEAN_SHUTDOWN = 6;
+
+  // OOM kill from /proc/vmstat delta. meta: count (v1 has no comm/process).
+  EVENT_TYPE_OOM_KILL = 7;
+
+  // Mount went read-only. meta: mount.
+  EVENT_TYPE_FS_READONLY = 8;
+
+  // Mount reached 100 percent. meta: mount.
+  EVENT_TYPE_DISK_FULL = 9;
+
+  // Clock skew above 30s detected. meta: skew_ms.
+  EVENT_TYPE_CLOCK_SKEW_DETECTED = 10;
+
+  // Self-updater. meta: from, to, error (optional).
+  EVENT_TYPE_AGENT_UPDATE_STARTED = 11;
+  EVENT_TYPE_AGENT_UPDATE_APPLIED = 12;
+  EVENT_TYPE_AGENT_UPDATE_FAILED = 13;
+
+  // Config module. meta: version, error (optional).
+  EVENT_TYPE_CONFIG_APPLIED = 14;
+  EVENT_TYPE_CONFIG_ERROR = 15;
+
+  // RAM ring dropped reports. meta: dropped_count.
+  EVENT_TYPE_BUFFER_OVERFLOW = 16;
+
+  // livck-agent uninstall (best effort).
+  EVENT_TYPE_UNINSTALL = 17;
+
+  // systemd unit feature. meta: unit, exec_status (optional), n_restarts.
+  EVENT_TYPE_UNIT_FAILED = 18;
+  EVENT_TYPE_UNIT_RESTARTED = 19;
+  EVENT_TYPE_UNIT_FLAPPING = 20;
+}

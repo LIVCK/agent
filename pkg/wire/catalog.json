@@ -1,0 +1,85 @@
+{
+  "catalog_version": 3,
+  "keys": [
+    {"key": "sys.cpu.total_pct", "unit": "percent", "source": "/proc/stat", "agg": "avg+max"},
+    {"key": "sys.cpu.user_pct", "unit": "percent", "source": "/proc/stat", "agg": "avg"},
+    {"key": "sys.cpu.system_pct", "unit": "percent", "source": "/proc/stat", "agg": "avg"},
+    {"key": "sys.cpu.iowait_pct", "unit": "percent", "source": "/proc/stat", "agg": "avg"},
+    {"key": "sys.cpu.steal_pct", "unit": "percent", "source": "/proc/stat", "agg": "avg"},
+
+    {"key": "sys.load.1", "unit": "float", "source": "/proc/loadavg", "agg": "avg"},
+    {"key": "sys.load.5", "unit": "float", "source": "/proc/loadavg", "agg": "avg"},
+    {"key": "sys.load.15", "unit": "float", "source": "/proc/loadavg", "agg": "avg"},
+
+    {"key": "sys.mem.total_bytes", "unit": "bytes", "source": "/proc/meminfo", "agg": "last"},
+    {"key": "sys.mem.used_bytes", "unit": "bytes", "source": "/proc/meminfo", "agg": "avg"},
+    {"key": "sys.mem.available_bytes", "unit": "bytes", "source": "/proc/meminfo", "agg": "avg"},
+    {"key": "sys.mem.used_pct", "unit": "percent", "source": "/proc/meminfo", "agg": "avg"},
+    {"key": "sys.mem.cached_bytes", "unit": "bytes", "source": "/proc/meminfo", "agg": "avg"},
+    {"key": "sys.mem.buffers_bytes", "unit": "bytes", "source": "/proc/meminfo", "agg": "avg"},
+    {"key": "sys.mem.oom_kills", "unit": "count", "source": "/proc/vmstat", "agg": "last"},
+
+    {"key": "sys.swap.total_bytes", "unit": "bytes", "source": "/proc/meminfo", "agg": "last"},
+    {"key": "sys.swap.used_bytes", "unit": "bytes", "source": "/proc/meminfo", "agg": "avg"},
+    {"key": "sys.swap.used_pct", "unit": "percent", "source": "/proc/meminfo", "agg": "avg"},
+
+    {"key": "sys.disk.{mount}.total_bytes", "unit": "bytes", "source": "statfs", "agg": "last", "wildcard": "mount"},
+    {"key": "sys.disk.{mount}.used_bytes", "unit": "bytes", "source": "statfs", "agg": "avg", "wildcard": "mount"},
+    {"key": "sys.disk.{mount}.used_pct", "unit": "percent", "source": "statfs", "agg": "avg", "wildcard": "mount"},
+    {"key": "sys.disk.{mount}.inodes_used_pct", "unit": "percent", "source": "statfs", "agg": "avg", "wildcard": "mount"},
+
+    {"key": "sys.diskio.{dev}.read_bps", "unit": "bytes_per_second", "source": "/proc/diskstats", "agg": "avg", "wildcard": "dev"},
+    {"key": "sys.diskio.{dev}.write_bps", "unit": "bytes_per_second", "source": "/proc/diskstats", "agg": "avg", "wildcard": "dev"},
+    {"key": "sys.diskio.{dev}.read_iops", "unit": "per_second", "source": "/proc/diskstats", "agg": "avg", "wildcard": "dev"},
+    {"key": "sys.diskio.{dev}.write_iops", "unit": "per_second", "source": "/proc/diskstats", "agg": "avg", "wildcard": "dev"},
+
+    {"key": "sys.net.{iface}.rx_bps", "unit": "bytes_per_second", "source": "/proc/net/dev", "agg": "avg", "wildcard": "iface"},
+    {"key": "sys.net.{iface}.tx_bps", "unit": "bytes_per_second", "source": "/proc/net/dev", "agg": "avg", "wildcard": "iface"},
+    {"key": "sys.net.{iface}.rx_errors_ps", "unit": "per_second", "source": "/proc/net/dev", "agg": "avg", "wildcard": "iface"},
+    {"key": "sys.net.{iface}.tx_errors_ps", "unit": "per_second", "source": "/proc/net/dev", "agg": "avg", "wildcard": "iface"},
+
+    {"key": "sys.psi.cpu_some_pct", "unit": "percent", "source": "/proc/pressure", "agg": "avg"},
+    {"key": "sys.psi.mem_some_pct", "unit": "percent", "source": "/proc/pressure", "agg": "avg"},
+    {"key": "sys.psi.io_some_pct", "unit": "percent", "source": "/proc/pressure", "agg": "avg"},
+
+    {"key": "sys.uptime_seconds", "unit": "seconds", "source": "/proc/uptime", "agg": "last"},
+
+    {"key": "sys.procs.total", "unit": "count", "source": "/proc", "agg": "avg"},
+    {"key": "sys.procs.zombies", "unit": "count", "source": "/proc", "agg": "avg"},
+
+    {"key": "sys.agent.rss_bytes", "unit": "bytes", "source": "self", "agg": "avg"},
+    {"key": "sys.agent.cpu_pct", "unit": "percent", "source": "self", "agg": "avg"},
+    {"key": "sys.agent.buffer_fill_pct", "unit": "percent", "source": "self", "agg": "avg"},
+    {"key": "sys.agent.dropped_reports", "unit": "count", "source": "self", "agg": "last"},
+    {"key": "sys.agent.stuck_mounts", "unit": "count", "source": "self", "agg": "max"},
+
+    {"key": "sys.gpu.{gpu}.util_pct", "unit": "percent", "source": "sysfs|nvidia-smi", "agg": "avg+max", "wildcard": "gpu"},
+    {"key": "sys.gpu.{gpu}.mem_used_pct", "unit": "percent", "source": "sysfs|nvidia-smi", "agg": "avg+max", "wildcard": "gpu"},
+    {"key": "sys.gpu.{gpu}.mem_used_bytes", "unit": "bytes", "source": "sysfs|nvidia-smi", "agg": "avg", "wildcard": "gpu"},
+    {"key": "sys.gpu.{gpu}.mem_total_bytes", "unit": "bytes", "source": "sysfs|nvidia-smi", "agg": "last", "wildcard": "gpu"},
+    {"key": "sys.gpu.{gpu}.temp_c", "unit": "celsius", "source": "sysfs|nvidia-smi", "agg": "avg+max", "wildcard": "gpu"},
+    {"key": "sys.gpu.{gpu}.power_w", "unit": "watt", "source": "sysfs|nvidia-smi", "agg": "avg+max", "wildcard": "gpu"},
+
+    {"key": "sys.smart.{dev}.health_ok", "unit": "bool", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.temp_c", "unit": "celsius", "source": "smartctl", "agg": "avg+max", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.reallocated", "unit": "count", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.pending", "unit": "count", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.power_on_hours", "unit": "hours", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.wear_pct", "unit": "percent", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.power_cycles", "unit": "count", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.available_spare_pct", "unit": "percent", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.media_errors", "unit": "count", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.unsafe_shutdowns", "unit": "count", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.critical_warning", "unit": "count", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.data_written_bytes", "unit": "bytes", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+    {"key": "sys.smart.{dev}.data_read_bytes", "unit": "bytes", "source": "smartctl", "agg": "last", "wildcard": "dev"},
+
+    {"key": "sys.probe.{target}.up", "unit": "bool", "source": "probe", "agg": "last", "wildcard": "target"},
+    {"key": "sys.probe.{target}.rtt_avg_ms", "unit": "milliseconds", "source": "probe", "agg": "last", "wildcard": "target"},
+    {"key": "sys.probe.{target}.rtt_min_ms", "unit": "milliseconds", "source": "probe", "agg": "last", "wildcard": "target"},
+    {"key": "sys.probe.{target}.rtt_max_ms", "unit": "milliseconds", "source": "probe", "agg": "last", "wildcard": "target"},
+    {"key": "sys.probe.{target}.loss_pct", "unit": "percent", "source": "probe", "agg": "last", "wildcard": "target"},
+    {"key": "sys.probe.{target}.http_status", "unit": "count", "source": "probe", "agg": "last", "wildcard": "target"},
+    {"key": "sys.probe.{target}.cert_expiry_hours", "unit": "hours", "source": "probe", "agg": "last", "wildcard": "target"}
+  ]
+}
