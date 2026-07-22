@@ -30,7 +30,7 @@ set -eu
 # ---- defaults (public hosts only; overridable via flags/env) ----------------
 DOWNLOAD_BASE="${LIVCK_DOWNLOAD_URL:-https://get.livck.cloud}"
 ENROLL_BASE="${LIVCK_ENROLL_URL:-https://app.livck.cloud}"
-VERSION="${LIVCK_AGENT_VERSION:-latest}"
+AGENT_VERSION="${LIVCK_AGENT_VERSION:-latest}"
 
 BINARY_PATH="/usr/bin/livck-agent"
 UNIT_PATH="/usr/lib/systemd/system/livck-agent.service"
@@ -84,8 +84,8 @@ while [ $# -gt 0 ]; do
         --tag=*)         TAGS="${TAGS:+$TAGS,}${1#*=}"; shift ;;
         --tags)          TAGS="${TAGS:+$TAGS,}${2:-}"; shift 2 ;;
         --tags=*)        TAGS="${TAGS:+$TAGS,}${1#*=}"; shift ;;
-        --version)       VERSION="${2:-}"; shift 2 ;;
-        --version=*)     VERSION="${1#*=}"; shift ;;
+        --version)       AGENT_VERSION="${2:-}"; shift 2 ;;
+        --version=*)     AGENT_VERSION="${1#*=}"; shift ;;
         --url)           ENROLL_BASE="${2:-}"; shift 2 ;;
         --url=*)         ENROLL_BASE="${1#*=}"; shift ;;
         --download-url)  DOWNLOAD_BASE="${2:-}"; shift 2 ;;
@@ -133,10 +133,14 @@ fi
 # Supported distro (Ubuntu 22.04/24.04, Debian 12, RHEL 9). RHEL-9 ABI rebuilds
 # (Rocky/Alma/CentOS Stream 9) are best-effort: WARN and continue.
 [ -r /etc/os-release ] || die 3 "cannot read /etc/os-release."
+# Read os-release in a SUBSHELL: sourcing it directly clobbers our own variables
+# (it sets NAME=, VERSION=, … which collide with the service name and the agent
+# version — e.g. VERSION would become "24.04.3 LTS (Noble Numbat)" and land in the
+# download URL). Extract only the fields we need.
 # shellcheck disable=SC1091
-. /etc/os-release
-OS_ID="${ID:-unknown}"
-OS_VER="${VERSION_ID:-0}"
+OS_ID="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-unknown}")"
+OS_VER="$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-0}")"
+OS_LIKE="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")"
 OS_MAJOR="${OS_VER%%.*}"
 supported=0
 case "$OS_ID" in
@@ -145,7 +149,7 @@ case "$OS_ID" in
     rhel)   [ "$OS_MAJOR" = "9" ] && supported=1 ;;
 esac
 if [ "$supported" -ne 1 ]; then
-    if printf '%s' "${ID_LIKE:-}" | grep -qw rhel && [ "$OS_MAJOR" = "9" ]; then
+    if printf '%s' "$OS_LIKE" | grep -qw rhel && [ "$OS_MAJOR" = "9" ]; then
         warn "distro $OS_ID $OS_VER is a RHEL-9 rebuild: best-effort, untested. Continuing."
     else
         die 3 "unsupported distro: $OS_ID $OS_VER (supported: Ubuntu 22.04/24.04, Debian 12, RHEL 9)."
@@ -204,7 +208,7 @@ verify_checksum() {
 install_via_package() {
     _fmt="$1"        # deb | rpm
     _pkgarch="$2"    # amd64/arm64 (deb) or x86_64/aarch64 (rpm)
-    _url="$DOWNLOAD_BASE/$_fmt/$VERSION/livck-agent_${_pkgarch}.$_fmt"
+    _url="$DOWNLOAD_BASE/$_fmt/$AGENT_VERSION/livck-agent_${_pkgarch}.$_fmt"
     _pkg="$DL.$_fmt"
     log "downloading $_fmt package ($_url)"
     if ! curl_to "$_url" "$_pkg"; then
@@ -274,7 +278,7 @@ create_user() {
 }
 
 install_via_binary() {
-    _url="$DOWNLOAD_BASE/binary/$VERSION/livck-agent_linux_${ARCH}"
+    _url="$DOWNLOAD_BASE/binary/$AGENT_VERSION/livck-agent_linux_${ARCH}"
     _bin="$DL.bin"
     log "downloading raw binary ($_url)"
     curl_to "$_url" "$_bin" || die 1 "download failed: $_url"
@@ -303,7 +307,7 @@ install_agent() {
     install_via_binary
 }
 
-log "installing livck-agent $VERSION for $OS_ID $OS_VER ($ARCH)"
+log "installing livck-agent $AGENT_VERSION for $OS_ID $OS_VER ($ARCH)"
 install_agent
 [ -x "$BINARY_PATH" ] || die 3 "installation failed: $BINARY_PATH not found."
 log "installed $("$BINARY_PATH" version 2>/dev/null || echo 'livck-agent')"
