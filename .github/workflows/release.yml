@@ -1,0 +1,82 @@
+name: release
+
+# Cut a GitHub release on a v* tag: cross-build the static agent binary
+# (amd64 + arm64), package deb + rpm via nfpm, and upload everything under
+# VERSIONLESS asset names. get.livck.cloud redirects /<fmt>/latest/<file> to
+# releases/latest/download/<file>, so GitHub's moving "latest" pointer (driven by
+# the versioned tag) plus versionless assets make both the `latest` install path
+# and a pinned `/<fmt>/vX.Y.Z/<file>` path resolve to the same files. install.sh
+# fetches exactly these names (livck-agent_amd64.deb, livck-agent_x86_64.rpm,
+# livck-agent_linux_amd64, …) and verifies the sibling .sha256.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # create the release + upload assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Resolve version
+        id: v
+        run: |
+          # Tag build -> strip the leading v; manual dispatch -> a dev stamp (no
+          # release is published on dispatch, only the build is exercised).
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build binaries + deb/rpm
+        run: make package VERSION=${{ steps.v.outputs.version }}
+
+      - name: Normalize to versionless asset names + checksums
+        working-directory: dist
+        run: |
+          set -eu
+          # deb: livck-agent_<ver>-<rel>_<arch>.deb -> livck-agent_<arch>.deb
+          for a in amd64 arm64; do mv -v livck-agent_*_"$a".deb "livck-agent_${a}.deb"; done
+          # rpm: livck-agent-<ver>-<rel>.<rpmarch>.rpm -> livck-agent_<rpmarch>.rpm
+          for a in x86_64 aarch64; do mv -v livck-agent-*."$a".rpm "livck-agent_${a}.rpm"; done
+          # sha256 sidecars for the packages (the raw binaries already carry one
+          # from `make dist`). install.sh reads only the hash column.
+          for f in livck-agent_amd64.deb livck-agent_arm64.deb livck-agent_x86_64.rpm livck-agent_aarch64.rpm; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          echo "== release assets =="; ls -1
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/livck-agent_linux_amd64 dist/livck-agent_linux_amd64.sha256 \
+            dist/livck-agent_linux_arm64 dist/livck-agent_linux_arm64.sha256 \
+            dist/livck-agent_amd64.deb dist/livck-agent_amd64.deb.sha256 \
+            dist/livck-agent_arm64.deb dist/livck-agent_arm64.deb.sha256 \
+            dist/livck-agent_x86_64.rpm dist/livck-agent_x86_64.rpm.sha256 \
+            dist/livck-agent_aarch64.rpm dist/livck-agent_aarch64.rpm.sha256
