@@ -112,9 +112,13 @@ fi
 
 # Not a container / LXC / Docker (namespaced /proc makes host KPIs ambiguous).
 in_container() {
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        v="$(systemd-detect-virt --container 2>/dev/null || echo none)"
-        [ "$v" != "none" ] && return 0
+    # --quiet returns the verdict as the exit status (0 = in a container) with no
+    # output. Parsing the printed string was wrong: on a bare host the command
+    # prints "none" AND exits non-zero, so `... || echo none` doubled it to
+    # "none\nnone" and `[ "$v" != "none" ]` fired — a false positive that blocked
+    # every real host (dedicated servers, KVM VMs, …).
+    if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container --quiet 2>/dev/null; then
+        return 0
     fi
     [ -f /.dockerenv ] && return 0
     if [ -r /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
