@@ -17,10 +17,23 @@
 # It also accepts --token directly for manual use (less safe: the token is then
 # visible in this script's argv while it runs).
 #
-# What it does: platform preflight (systemd, not-a-container, supported distro +
-# arch) -> download and integrity-check the deb/rpm (or the raw binary as a
-# fallback) -> install -> enroll -> enable + start. Idempotent: re-running
-# upgrades in place and re-enroll is a no-op unless --force.
+# What it does: platform preflight (systemd, not-a-container, arch) -> download
+# and integrity-check the deb/rpm (or the raw binary as a fallback) -> install ->
+# enroll -> enable + start. Idempotent: re-running upgrades in place and re-enroll
+# is a no-op unless --force.
+#
+# Robustness notes:
+#   * The whole program lives in main(), invoked on the LAST line. A shell reading
+#     this over `curl | sh` must parse the entire function body (to the closing
+#     brace) before it executes anything, so (a) an early exit can never leave curl
+#     writing into a closed pipe -- the source of the ugly `curl: (23) Failure
+#     writing output to destination` -- and (b) a truncated download fails as a
+#     syntax error instead of running a half-script.
+#   * The agent is a pure-static binary + a systemd unit, so it runs on effectively
+#     any systemd Linux. The distro list is therefore a "stay silent on tested
+#     combos" allowlist only -- anything else is best-effort (warn + continue),
+#     never a hard stop. Hard failures are reserved for the things that truly
+#     prevent it from running: no systemd, a container, or an unbuilt CPU arch.
 #
 # POSIX sh (works under sh and bash). No `pipefail` (not portable to dash): all
 # downloads go to a file and are checked explicitly. ASCII only.
@@ -71,114 +84,7 @@ Usage: install.sh [options]
 EOF
 }
 
-# ---- argument parsing (supports --flag value and --flag=value) --------------
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --token)         TOKEN="${2:-}"; shift 2 ;;
-        --token=*)       TOKEN="${1#*=}"; shift ;;
-        --token-file)    TOKEN_FILE="${2:-}"; shift 2 ;;
-        --token-file=*)  TOKEN_FILE="${1#*=}"; shift ;;
-        --name)          NAME="${2:-}"; shift 2 ;;
-        --name=*)        NAME="${1#*=}"; shift ;;
-        --tag)           TAGS="${TAGS:+$TAGS,}${2:-}"; shift 2 ;;
-        --tag=*)         TAGS="${TAGS:+$TAGS,}${1#*=}"; shift ;;
-        --tags)          TAGS="${TAGS:+$TAGS,}${2:-}"; shift 2 ;;
-        --tags=*)        TAGS="${TAGS:+$TAGS,}${1#*=}"; shift ;;
-        --version)       AGENT_VERSION="${2:-}"; shift 2 ;;
-        --version=*)     AGENT_VERSION="${1#*=}"; shift ;;
-        --url)           ENROLL_BASE="${2:-}"; shift 2 ;;
-        --url=*)         ENROLL_BASE="${1#*=}"; shift ;;
-        --download-url)  DOWNLOAD_BASE="${2:-}"; shift 2 ;;
-        --download-url=*) DOWNLOAD_BASE="${1#*=}"; shift ;;
-        --force)         FORCE=1; shift ;;
-        --skip-enroll)   SKIP_ENROLL=1; shift ;;
-        -h|--help)       usage; exit 0 ;;
-        *)               usage; die 2 "unknown argument: $1" ;;
-    esac
-done
-
-# ---- preflight: privileges + required tools ---------------------------------
-[ "$(id -u)" = "0" ] || die 2 "must run as root (use sudo)."
-command -v curl >/dev/null 2>&1 || die 2 "curl is required."
-command -v uname >/dev/null 2>&1 || die 2 "uname is required."
-command -v systemctl >/dev/null 2>&1 || die 3 "systemctl not found; systemd is required."
-
-# ---- preflight: platform (unsupported => exit 3) ----------------------------
-# systemd present and PID 1.
-[ -d /run/systemd/system ] || die 3 "systemd is required (no /run/systemd/system)."
-if [ "$(cat /proc/1/comm 2>/dev/null || echo unknown)" != "systemd" ]; then
-    die 3 "PID 1 is not systemd; unsupported init system."
-fi
-
-# Not a container / LXC / Docker (namespaced /proc makes host KPIs ambiguous).
-in_container() {
-    # --quiet returns the verdict as the exit status (0 = in a container) with no
-    # output. Parsing the printed string was wrong: on a bare host the command
-    # prints "none" AND exits non-zero, so `... || echo none` doubled it to
-    # "none\nnone" and `[ "$v" != "none" ]` fired — a false positive that blocked
-    # every real host (dedicated servers, KVM VMs, …).
-    if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container --quiet 2>/dev/null; then
-        return 0
-    fi
-    [ -f /.dockerenv ] && return 0
-    if [ -r /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
-        return 0
-    fi
-    return 1
-}
-if in_container; then
-    die 3 "containers/LXC are not supported in v1 (namespaced /proc). See the roadmap."
-fi
-
-# Supported distro (Ubuntu 22.04/24.04, Debian 12, RHEL 9). RHEL-9 ABI rebuilds
-# (Rocky/Alma/CentOS Stream 9) are best-effort: WARN and continue.
-[ -r /etc/os-release ] || die 3 "cannot read /etc/os-release."
-# Read os-release in a SUBSHELL: sourcing it directly clobbers our own variables
-# (it sets NAME=, VERSION=, … which collide with the service name and the agent
-# version — e.g. VERSION would become "24.04.3 LTS (Noble Numbat)" and land in the
-# download URL). Extract only the fields we need.
-# shellcheck disable=SC1091
-OS_ID="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-unknown}")"
-OS_VER="$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-0}")"
-OS_LIKE="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")"
-OS_MAJOR="${OS_VER%%.*}"
-supported=0
-case "$OS_ID" in
-    ubuntu) case "$OS_VER" in 22.04|24.04) supported=1 ;; esac ;;
-    debian) [ "$OS_MAJOR" = "12" ] && supported=1 ;;
-    rhel)   [ "$OS_MAJOR" = "9" ] && supported=1 ;;
-esac
-if [ "$supported" -ne 1 ]; then
-    if printf '%s' "$OS_LIKE" | grep -qw rhel && [ "$OS_MAJOR" = "9" ]; then
-        warn "distro $OS_ID $OS_VER is a RHEL-9 rebuild: best-effort, untested. Continuing."
-    else
-        die 3 "unsupported distro: $OS_ID $OS_VER (supported: Ubuntu 22.04/24.04, Debian 12, RHEL 9)."
-    fi
-fi
-
-# Supported architecture.
-case "$(uname -m)" in
-    x86_64)  ARCH="amd64";  RAW_ARCH="x86_64" ;;
-    aarch64) ARCH="arm64";  RAW_ARCH="aarch64" ;;
-    *)       die 3 "unsupported architecture: $(uname -m) (supported: x86_64, aarch64)." ;;
-esac
-
-# ---- token requirement ------------------------------------------------------
-if [ -z "$SKIP_ENROLL" ] && [ -z "$TOKEN" ] && [ -z "$TOKEN_FILE" ]; then
-    usage
-    die 2 "an enrollment token is required (--token-file or --token), or pass --skip-enroll."
-fi
-if [ -n "$TOKEN_FILE" ] && [ ! -r "$TOKEN_FILE" ]; then
-    die 2 "token file not readable: $TOKEN_FILE"
-fi
-
-# ---- temp workspace ---------------------------------------------------------
-umask 077
-WORKDIR="$(mktemp -d)"
-cleanup() { rm -rf "$WORKDIR" 2>/dev/null || :; }
-trap cleanup EXIT INT TERM
-DL="$WORKDIR/dl"
-
+# ---- download + integrity helpers -------------------------------------------
 # curl_to <url> <dest> : download with retries; returns non-zero on failure.
 curl_to() {
     curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$2" "$1"
@@ -202,6 +108,38 @@ verify_checksum() {
     _actual="$(sha256_of "$1")"
     [ -n "$_actual" ] || { warn "no sha256 tool; cannot verify integrity."; return 2; }
     [ "$_expected" = "$_actual" ]
+}
+
+# ---- container detection ----------------------------------------------------
+# Not a container / LXC / Docker (namespaced /proc makes host KPIs ambiguous).
+in_container() {
+    # --quiet returns the verdict as the exit status (0 = in a container) with no
+    # output. Parsing the printed string was wrong: on a bare host the command
+    # prints "none" AND exits non-zero, so `... || echo none` doubled it to
+    # "none\nnone" and `[ "$v" != "none" ]` fired -- a false positive that blocked
+    # every real host (dedicated servers, KVM VMs, ...).
+    if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container --quiet 2>/dev/null; then
+        return 0
+    fi
+    [ -f /.dockerenv ] && return 0
+    if [ -r /proc/1/cgroup ] && grep -qE '(docker|lxc|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# is_tested_distro : 0 if $OS_ID/$OS_VER is a combo we actively test (=> stay
+# silent), 1 otherwise (=> best-effort, warn + continue). NOT a gate: the static
+# binary + systemd unit install on any systemd Linux, so an unknown distro is a
+# warning, never a stop.
+is_tested_distro() {
+    case "$OS_ID" in
+        ubuntu) case "$OS_VER" in 22.04|24.04) return 0 ;; esac ;;
+        debian) case "$OS_MAJOR" in 12|13) return 0 ;; esac ;;
+        rhel|rocky|almalinux|centos)
+            [ "$OS_MAJOR" = "9" ] && return 0 ;;
+    esac
+    return 1
 }
 
 # ---- install via native package if possible, else raw binary ----------------
@@ -307,59 +245,149 @@ install_agent() {
     install_via_binary
 }
 
-log "installing livck-agent $AGENT_VERSION for $OS_ID $OS_VER ($ARCH)"
-install_agent
-[ -x "$BINARY_PATH" ] || die 3 "installation failed: $BINARY_PATH not found."
-log "installed $("$BINARY_PATH" version 2>/dev/null || echo 'livck-agent')"
+# ---- main -------------------------------------------------------------------
+main() {
+    # ---- argument parsing (supports --flag value and --flag=value) ----------
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --token)         TOKEN="${2:-}"; shift 2 ;;
+            --token=*)       TOKEN="${1#*=}"; shift ;;
+            --token-file)    TOKEN_FILE="${2:-}"; shift 2 ;;
+            --token-file=*)  TOKEN_FILE="${1#*=}"; shift ;;
+            --name)          NAME="${2:-}"; shift 2 ;;
+            --name=*)        NAME="${1#*=}"; shift ;;
+            --tag)           TAGS="${TAGS:+$TAGS,}${2:-}"; shift 2 ;;
+            --tag=*)         TAGS="${TAGS:+$TAGS,}${1#*=}"; shift ;;
+            --tags)          TAGS="${TAGS:+$TAGS,}${2:-}"; shift 2 ;;
+            --tags=*)        TAGS="${TAGS:+$TAGS,}${1#*=}"; shift ;;
+            --version)       AGENT_VERSION="${2:-}"; shift 2 ;;
+            --version=*)     AGENT_VERSION="${1#*=}"; shift ;;
+            --url)           ENROLL_BASE="${2:-}"; shift 2 ;;
+            --url=*)         ENROLL_BASE="${1#*=}"; shift ;;
+            --download-url)  DOWNLOAD_BASE="${2:-}"; shift 2 ;;
+            --download-url=*) DOWNLOAD_BASE="${1#*=}"; shift ;;
+            --force)         FORCE=1; shift ;;
+            --skip-enroll)   SKIP_ENROLL=1; shift ;;
+            -h|--help)       usage; exit 0 ;;
+            *)               usage; die 2 "unknown argument: $1" ;;
+        esac
+    done
 
-# ---- enroll -----------------------------------------------------------------
-if [ -n "$SKIP_ENROLL" ]; then
-    log "--skip-enroll set; not enrolling or starting. Enroll later with 'livck-agent enroll'."
+    # ---- preflight: privileges + required tools -----------------------------
+    [ "$(id -u)" = "0" ] || die 2 "must run as root (use sudo)."
+    command -v curl >/dev/null 2>&1 || die 2 "curl is required."
+    command -v uname >/dev/null 2>&1 || die 2 "uname is required."
+    command -v systemctl >/dev/null 2>&1 || die 3 "systemctl not found; systemd is required."
+
+    # ---- preflight: platform (unsupported => exit 3) ------------------------
+    # systemd present and PID 1.
+    [ -d /run/systemd/system ] || die 3 "systemd is required (no /run/systemd/system)."
+    if [ "$(cat /proc/1/comm 2>/dev/null || echo unknown)" != "systemd" ]; then
+        die 3 "PID 1 is not systemd; unsupported init system."
+    fi
+
+    if in_container; then
+        die 3 "containers/LXC are not supported in v1 (namespaced /proc). See the roadmap."
+    fi
+
+    # ---- distro (best-effort: warn + continue, never a hard stop) -----------
+    # Read os-release in a SUBSHELL: sourcing it directly clobbers our own
+    # variables (it sets NAME=, VERSION=, ... which collide with the service name
+    # and the agent version -- e.g. VERSION would become "24.04.3 LTS (Noble
+    # Numbat)" and land in the download URL). Extract only the fields we need.
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        OS_ID="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-unknown}")"
+        OS_VER="$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-0}")"
+    else
+        warn "cannot read /etc/os-release; assuming a generic systemd Linux."
+        OS_ID="unknown"; OS_VER="0"
+    fi
+    OS_MAJOR="${OS_VER%%.*}"
+    if ! is_tested_distro; then
+        warn "distro '$OS_ID $OS_VER' is outside the tested set (Ubuntu 22.04/24.04, Debian 12/13, RHEL 9); the static agent still installs -- continuing best-effort."
+    fi
+
+    # ---- supported architecture (genuinely hard: we only build these) -------
+    case "$(uname -m)" in
+        x86_64)  ARCH="amd64";  RAW_ARCH="x86_64" ;;
+        aarch64) ARCH="arm64";  RAW_ARCH="aarch64" ;;
+        *)       die 3 "unsupported architecture: $(uname -m) (supported: x86_64, aarch64)." ;;
+    esac
+
+    # ---- token requirement --------------------------------------------------
+    if [ -z "$SKIP_ENROLL" ] && [ -z "$TOKEN" ] && [ -z "$TOKEN_FILE" ]; then
+        usage
+        die 2 "an enrollment token is required (--token-file or --token), or pass --skip-enroll."
+    fi
+    if [ -n "$TOKEN_FILE" ] && [ ! -r "$TOKEN_FILE" ]; then
+        die 2 "token file not readable: $TOKEN_FILE"
+    fi
+
+    # ---- temp workspace -----------------------------------------------------
+    umask 077
+    WORKDIR="$(mktemp -d)"
+    trap 'rm -rf "$WORKDIR" 2>/dev/null || :' EXIT INT TERM
+    DL="$WORKDIR/dl"
+
+    log "installing livck-agent $AGENT_VERSION for $OS_ID $OS_VER ($ARCH)"
+    install_agent
+    [ -x "$BINARY_PATH" ] || die 3 "installation failed: $BINARY_PATH not found."
+    log "installed $("$BINARY_PATH" version 2>/dev/null || echo 'livck-agent')"
+
+    # ---- enroll -------------------------------------------------------------
+    if [ -n "$SKIP_ENROLL" ]; then
+        log "--skip-enroll set; not enrolling or starting. Enroll later with 'livck-agent enroll'."
+        exit 0
+    fi
+
+    # State dir must exist and be owned by the agent user before first start so
+    # the enroll writes (identity/token, 0600) are readable by the service.
+    # systemd's StateDirectory will adopt this exact dir on start.
+    install -d -m 0700 -o "$USER_NAME" -g "$USER_NAME" "$STATE_DIR"
+
+    # Copy the token into a fresh 0600 file the enroll verb reads then unlinks.
+    # This never touches the caller's original --token-file.
+    TF="$WORKDIR/token"
+    : > "$TF"
+    chmod 0600 "$TF"
+    if [ -n "$TOKEN_FILE" ]; then
+        cat "$TOKEN_FILE" > "$TF"
+    else
+        printf '%s' "$TOKEN" > "$TF"
+    fi
+
+    # Build enroll args (token never appears here; it is in the file).
+    set -- enroll --token-file "$TF" --url "$ENROLL_BASE"
+    [ -n "$NAME" ] && set -- "$@" --name "$NAME"
+    [ -n "$TAGS" ] && set -- "$@" --tags "$TAGS"
+    [ -n "$FORCE" ] && set -- "$@" --force
+
+    # Run enroll as root; it writes into $STATE_DIR. Fix ownership afterwards so
+    # the non-root service can read the 0600 identity/token files.
+    log "enrolling with the LIVCK control plane..."
+    set +e
+    "$BINARY_PATH" "$@"
+    enroll_rc=$?
+    set -e
+    chown -R "$USER_NAME:$USER_NAME" "$STATE_DIR" 2>/dev/null || :
+
+    case "$enroll_rc" in
+        0) log "enrolled." ;;
+        4) log "already enrolled (config refreshed). Use --force to re-enroll." ;;
+        2) die 2 "enroll rejected the arguments." ;;
+        3) die 3 "enroll failed permanently (see the message above)." ;;
+        *) die 1 "enroll failed (retryable). Re-run the installer to try again." ;;
+    esac
+
+    # ---- enable + start -----------------------------------------------------
+    log "enabling and starting $SERVICE"
+    systemctl enable --now "$SERVICE" >&2
+
+    log "done. Check status with: systemctl status $SERVICE"
     exit 0
-fi
+}
 
-# State dir must exist and be owned by the agent user before first start so the
-# enroll writes (identity/token, 0600) are readable by the service. systemd's
-# StateDirectory will adopt this exact dir on start.
-install -d -m 0700 -o "$USER_NAME" -g "$USER_NAME" "$STATE_DIR"
-
-# Copy the token into a fresh 0600 file the enroll verb reads then unlinks. This
-# never touches the caller's original --token-file.
-TF="$WORKDIR/token"
-: > "$TF"
-chmod 0600 "$TF"
-if [ -n "$TOKEN_FILE" ]; then
-    cat "$TOKEN_FILE" > "$TF"
-else
-    printf '%s' "$TOKEN" > "$TF"
-fi
-
-# Build enroll args (token never appears here; it is in the file).
-set -- enroll --token-file "$TF" --url "$ENROLL_BASE"
-[ -n "$NAME" ] && set -- "$@" --name "$NAME"
-[ -n "$TAGS" ] && set -- "$@" --tags "$TAGS"
-[ -n "$FORCE" ] && set -- "$@" --force
-
-# Run enroll as root; it writes into $STATE_DIR. Fix ownership afterwards so the
-# non-root service can read the 0600 identity/token files.
-log "enrolling with the LIVCK control plane..."
-set +e
-"$BINARY_PATH" "$@"
-enroll_rc=$?
-set -e
-chown -R "$USER_NAME:$USER_NAME" "$STATE_DIR" 2>/dev/null || :
-
-case "$enroll_rc" in
-    0) log "enrolled." ;;
-    4) log "already enrolled (config refreshed). Use --force to re-enroll." ;;
-    2) die 2 "enroll rejected the arguments." ;;
-    3) die 3 "enroll failed permanently (see the message above)." ;;
-    *) die 1 "enroll failed (retryable). Re-run the installer to try again." ;;
-esac
-
-# ---- enable + start ---------------------------------------------------------
-log "enabling and starting $SERVICE"
-systemctl enable --now "$SERVICE" >&2
-
-log "done. Check status with: systemctl status $SERVICE"
-exit 0
+# Invoked last so the shell parses the whole script before running anything (see
+# the robustness notes in the header): no truncated-pipe execution, no curl(23).
+main "$@"
