@@ -183,3 +183,17 @@ func (s *Store) SetConfig(raw []byte) error {
 	}
 	return s.fs.WriteFileAtomic(s.path(ConfigFile), raw, secretPerm)
 }
+
+// Reset removes the persisted identity so the next enroll starts fresh: the
+// instance_id, enrollment_id, managed token, learned ingest URL and the last-good
+// config cache. It leaves the state directory itself in place and is idempotent —
+// a missing file is not an error. This is the local half of a clean re-enroll and
+// the only sanctioned way to drop the instance_id (which is otherwise never wiped).
+func (s *Store) Reset() error {
+	for _, name := range []string{instanceIDFile, enrollmentIDFile, tokenFile, ingestURLFile, ConfigFile} {
+		if err := s.fs.Remove(s.path(name)); err != nil {
+			return fmt.Errorf("remove %s: %w", name, err)
+		}
+	}
+	return nil
+}

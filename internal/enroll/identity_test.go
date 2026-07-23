@@ -20,6 +20,47 @@ func newStore() (*Store, *platformtest.MemFS) {
 	return NewStore(fs, "/state", gen), fs
 }
 
+func TestStoreResetWipesIdentityAndIsIdempotent(t *testing.T) {
+	s, _ := newStore()
+
+	// Populate a full identity.
+	if _, err := s.LoadOrCreateInstanceID(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadOrCreateEnrollmentID(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetToken("lvk_test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetIngestURL("https://ingest.test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetConfig([]byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	if !s.HasToken() {
+		t.Fatal("token should be present before reset")
+	}
+
+	if err := s.Reset(); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+
+	// Token and instance_id are gone; a fresh enroll would start clean.
+	if s.HasToken() {
+		t.Fatal("token should be gone after reset")
+	}
+	if _, err := s.InstanceID(); err == nil {
+		t.Fatal("instance_id should be gone after reset")
+	}
+
+	// Idempotent: a second reset on already-empty state is a no-op.
+	if err := s.Reset(); err != nil {
+		t.Fatalf("second reset should be a no-op, got %v", err)
+	}
+}
+
 func TestInstanceIDCreateThenStable(t *testing.T) {
 	s, _ := newStore()
 	id, err := s.LoadOrCreateInstanceID()

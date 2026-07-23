@@ -1,8 +1,9 @@
 // Command livck-agent is the LIVCK server monitoring agent. This file is wiring
 // only: it assembles the foundation (platform, identity, config, buffer, sender,
 // runner) and runs the collect loop until a shutdown signal. It also wires the
-// enroll verb (the client-initiated registration handshake) and the doctor verb
-// (read-only self-diagnosis); reset and uninstall are not implemented yet.
+// enroll verb (the client-initiated registration handshake), the doctor verb
+// (read-only self-diagnosis), reset (wipe the local identity for a clean
+// re-enroll) and uninstall (stop, remove and purge the agent).
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -53,6 +55,16 @@ const (
 	exitAlreadyEnrolled = 4 // managed token already present; pass --force to redo
 )
 
+// Packaged install paths, shared by the uninstall verb. These MUST match the deb/
+// rpm layout (packaging/nfpm.yaml) and install.sh's raw-binary fallback.
+const (
+	serviceUnit = "livck-agent.service"
+	unitPath    = "/usr/lib/systemd/system/livck-agent.service"
+	binaryPath  = "/usr/bin/livck-agent"
+	configDir   = "/etc/livck-agent"
+	agentUser   = "livck-agent"
+)
+
 // maxProcs caps the Go runtime's parallelism. A metric sampler is I/O-bound and
 // needs no host-scaled concurrency; without this the runtime sizes its scheduler
 // threads, GC workers and per-P caches to the host core count, so the SAME binary
@@ -86,8 +98,11 @@ func main() {
 		cmd = os.Args[1]
 	}
 	switch cmd {
-	case "version":
+	case "version", "-v", "--version":
 		fmt.Println("livck-agent " + version)
+		return
+	case "-h", "--help", "help":
+		printUsage()
 		return
 	case "run":
 		if err := run(); err != nil {
@@ -98,11 +113,32 @@ func main() {
 		os.Exit(enrollCmd(os.Args[2:]))
 	case "doctor":
 		os.Exit(doctorCmd(os.Args[2:]))
+	case "reset":
+		os.Exit(resetCmd(os.Args[2:]))
+	case "uninstall":
+		os.Exit(uninstallCmd(os.Args[2:]))
 	default:
-		// reset/uninstall are not implemented yet.
-		fmt.Fprintln(os.Stderr, "livck-agent: unknown command "+cmd+" (run, enroll, doctor, version)")
+		fmt.Fprintln(os.Stderr, "livck-agent: unknown command "+cmd+" (run, enroll, reset, uninstall, doctor, version)")
 		os.Exit(2)
 	}
+}
+
+// printUsage renders the top-level command summary (livck-agent, -h, --help, help).
+func printUsage() {
+	fmt.Print(`livck-agent - LIVCK server monitoring agent
+
+Usage: livck-agent <command> [options]
+
+Commands:
+  run                    run the agent (the systemd unit calls this)
+  enroll --token lve_... register this host with LIVCK (--force to re-enroll)
+  reset                  wipe the local identity for a clean re-enroll (keeps the install)
+  uninstall              stop, remove and purge the agent (--keep-data keeps state)
+  doctor                 read-only self-diagnosis
+  version                print the version
+
+Run 'livck-agent <command> -h' for a command's options.
+`)
 }
 
 // enrollCmd runs the enroll verb: it parses flags, resolves the bootstrap token
@@ -390,6 +426,158 @@ func run() error {
 		"gomaxprocs", runtime.GOMAXPROCS(0), "numcpu", runtime.NumCPU())
 	return r.Run(ctx)
 }
+
+// resetCmd wipes the local identity (instance_id, enrollment_id, managed token,
+// learned ingest URL, last-good config) so the next enroll starts fresh. It keeps
+// the binary, the systemd unit and the system user — it is the local half of a
+// clean re-enroll, and the sanctioned way out of a corrupt identity.
+func resetCmd(args []string) int {
+	fs := flag.NewFlagSet("reset", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "livck-agent: reset must run as root (use sudo).")
+		return exitUsage
+	}
+
+	stateDir := resolveStateDir()
+	if !confirm(*yes, fmt.Sprintf("Wipe the local agent identity in %s (token + instance id)?", stateDir)) {
+		fmt.Fprintln(os.Stderr, "livck-agent: reset aborted.")
+		return exitOK
+	}
+
+	store := enroll.NewStore(platform.Real().FS, stateDir, uuid.NewString)
+	if err := store.Reset(); err != nil {
+		fmt.Fprintln(os.Stderr, "livck-agent: reset failed: "+err.Error())
+		return exitFatal
+	}
+
+	fmt.Println("livck-agent: local identity wiped. Re-enroll with: livck-agent enroll --token lve_...")
+	fmt.Println("livck-agent: if the service is running, restart it after enrolling: systemctl restart " + serviceUnit)
+	return exitOK
+}
+
+// uninstallCmd tears the agent down locally. It never contacts the control plane
+// (the server-side service record stays; the operator removes it in the dashboard).
+// For a deb/rpm install it delegates to the package manager so the package DB stays
+// consistent; for the raw-binary install (install.sh fallback) it removes the unit
+// and binary itself. Unless --keep-data is set it also purges the identity/token,
+// the config and the system user.
+func uninstallCmd(args []string) int {
+	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
+	var (
+		yes      = fs.Bool("yes", false, "skip the confirmation prompt")
+		keepData = fs.Bool("keep-data", false, "keep the identity/token, config and system user")
+	)
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "livck-agent: uninstall must run as root (use sudo).")
+		return exitUsage
+	}
+
+	prompt := "Uninstall livck-agent"
+	if !*keepData {
+		prompt += " and delete its identity/token, config and system user"
+	}
+	if !confirm(*yes, prompt+"?") {
+		fmt.Fprintln(os.Stderr, "livck-agent: uninstall aborted.")
+		return exitOK
+	}
+
+	// Stop + disable first so nothing restarts mid-teardown (best-effort).
+	runQuiet("systemctl", "disable", "--now", serviceUnit)
+
+	switch {
+	case debInstalled():
+		fmt.Println("livck-agent: removing the deb package...")
+		if *keepData {
+			runLoud("apt-get", "remove", "-y", "livck-agent")
+		} else if !runLoud("apt-get", "purge", "-y", "livck-agent") {
+			// apt-get absent or failed (dpkg-only box): purge via dpkg directly.
+			runLoud("dpkg", "--purge", "livck-agent")
+		}
+		// A deb purge runs postremove, which already wipes state/config/user.
+	case rpmInstalled():
+		fmt.Println("livck-agent: removing the rpm package...")
+		if hasCmd("dnf") {
+			runLoud("dnf", "remove", "-y", "livck-agent")
+		} else {
+			runLoud("yum", "remove", "-y", "livck-agent")
+		}
+		// rpm has no purge phase (postremove keeps state), so purge here.
+		if !*keepData {
+			purgeState()
+		}
+	default:
+		fmt.Println("livck-agent: removing the raw-binary install...")
+		_ = os.Remove(unitPath)
+		runQuiet("systemctl", "daemon-reload")
+		_ = os.Remove(binaryPath) // safe while running: Linux keeps the open inode
+		if !*keepData {
+			purgeState()
+		}
+	}
+
+	fmt.Println("livck-agent: uninstalled. The server-side service record (if any) stays — remove it in the LIVCK dashboard.")
+	return exitOK
+}
+
+// confirm returns true when the user answers yes, or immediately when skip is set
+// (--yes). A non-interactive stdin (no answer) reads as "no", so a piped invocation
+// never tears anything down without an explicit --yes.
+func confirm(skip bool, prompt string) bool {
+	if skip {
+		return true
+	}
+	fmt.Fprintf(os.Stderr, "%s [y/N] ", prompt)
+	var resp string
+	_, _ = fmt.Fscanln(os.Stdin, &resp)
+	switch strings.ToLower(strings.TrimSpace(resp)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// purgeState removes the persisted state + config and the dedicated system user.
+func purgeState() {
+	_ = os.RemoveAll(resolveStateDir())
+	_ = os.RemoveAll(configDir)
+	runQuiet("userdel", agentUser)
+	runQuiet("groupdel", agentUser)
+}
+
+func hasCmd(name string) bool { _, err := exec.LookPath(name); return err == nil }
+
+// debInstalled reports whether dpkg has livck-agent registered as installed.
+func debInstalled() bool {
+	if !hasCmd("dpkg-query") {
+		return false
+	}
+	out, err := exec.Command("dpkg-query", "-W", "-f=${Status}", "livck-agent").Output()
+	return err == nil && strings.Contains(string(out), "install ok installed")
+}
+
+// rpmInstalled reports whether rpm has livck-agent in its database.
+func rpmInstalled() bool {
+	return hasCmd("rpm") && exec.Command("rpm", "-q", "livck-agent").Run() == nil
+}
+
+// runLoud runs a command with stdout/stderr wired through to the user and reports
+// success. Used for the package-manager step so its output is visible.
+func runLoud(name string, args ...string) bool {
+	c := exec.Command(name, args...)
+	c.Stdout, c.Stderr = os.Stdout, os.Stderr
+	return c.Run() == nil
+}
+
+// runQuiet runs a command best-effort, discarding output.
+func runQuiet(name string, args ...string) { _ = exec.Command(name, args...).Run() }
 
 // resolveStateDir prefers the systemd StateDirectory, then an override, then the
 // packaged default.
