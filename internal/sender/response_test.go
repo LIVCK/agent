@@ -40,6 +40,21 @@ func TestParseResponseOK(t *testing.T) {
 	if r.configVersion != 9 || r.serverTimeMs != 1700000000000 {
 		t.Fatalf("parsed wrong 202 body: %+v", r)
 	}
+	if r.dropped.any() {
+		t.Fatalf("no dropped block must parse as zero drops: %+v", r.dropped)
+	}
+}
+
+func TestParseResponseOKDropped(t *testing.T) {
+	body := []byte(`{"status":"ok","config_version":9,"server_time_unix_ms":1700000000000,` +
+		`"dropped":{"reports":0,"keys":12,"events":1},"drop_reasons":{"cardinality":12,"sanity":1}}`)
+	r := parseResponse(202, http.Header{}, body)
+	if !r.dropped.any() || r.dropped.Keys != 12 || r.dropped.Events != 1 {
+		t.Fatalf("dropped block not parsed: %+v", r.dropped)
+	}
+	if r.dropReasons["cardinality"] != 12 || r.dropReasons["sanity"] != 1 {
+		t.Fatalf("drop_reasons not parsed: %+v", r.dropReasons)
+	}
 }
 
 func TestParseResponseRetryAfterHeaderWins(t *testing.T) {

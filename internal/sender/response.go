@@ -33,12 +33,27 @@ type response struct {
 	serverTimeMs  int64
 	retryAfter    time.Duration
 	errorCode     string
+	dropped       okDropped
+	dropReasons   map[string]int
 }
 
+// okDropped mirrors the 202 "dropped" block: pulse accepts the batch but may
+// silently shed reports/keys/events (cardinality caps, unknown keys, sanity).
+// Surfacing it is the ONLY way an operator ever learns a family was cut.
+type okDropped struct {
+	Reports int `json:"reports"`
+	Keys    int `json:"keys"`
+	Events  int `json:"events"`
+}
+
+func (d okDropped) any() bool { return d.Reports > 0 || d.Keys > 0 || d.Events > 0 }
+
 type okBody struct {
-	Status           string `json:"status"`
-	ConfigVersion    uint32 `json:"config_version"`
-	ServerTimeUnixMs int64  `json:"server_time_unix_ms"`
+	Status           string         `json:"status"`
+	ConfigVersion    uint32         `json:"config_version"`
+	ServerTimeUnixMs int64          `json:"server_time_unix_ms"`
+	Dropped          okDropped      `json:"dropped"`
+	DropReasons      map[string]int `json:"drop_reasons"`
 }
 
 type errBody struct {
@@ -95,6 +110,8 @@ func parseResponse(status int, header http.Header, body []byte) response {
 		if json.Unmarshal(body, &ok) == nil {
 			r.configVersion = ok.ConfigVersion
 			r.serverTimeMs = ok.ServerTimeUnixMs
+			r.dropped = ok.Dropped
+			r.dropReasons = ok.DropReasons
 		}
 	default:
 		var e errBody

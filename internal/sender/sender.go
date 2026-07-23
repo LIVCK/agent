@@ -210,6 +210,16 @@ func (s *Sender) Run(ctx context.Context) {
 // fingerprint delivered, trigger a config pull if a newer version was
 // advertised, and check clock skew.
 func (s *Sender) onAccepted(p *pending, resp response) {
+	// A 202 can still shed data (cardinality caps, unknown keys). Without this
+	// line a silently cut family (probes, SMART, …) is invisible everywhere:
+	// the batch succeeds, the charts just thin out.
+	if resp.dropped.any() {
+		s.log.Warn("ingest accepted batch but dropped data",
+			"reports", resp.dropped.Reports,
+			"keys", resp.dropped.Keys,
+			"events", resp.dropped.Events,
+			"reasons", resp.dropReasons)
+	}
 	s.opt.Buffer.Remove(p.seqs)
 	s.opt.Events.Remove(p.eventIDs)
 	if p.carriedFingerprint {
