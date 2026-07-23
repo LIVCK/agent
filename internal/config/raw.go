@@ -65,9 +65,10 @@ type rawSystemd struct {
 }
 
 type rawUpdate struct {
-	Autoupdate    *bool      `json:"autoupdate"`
-	TargetVersion *string    `json:"target_version"`
-	Window        *rawWindow `json:"window"`
+	Autoupdate     *bool             `json:"autoupdate"`
+	TargetVersion  *string           `json:"target_version"`
+	ArtifactSHA256 map[string]string `json:"artifact_sha256"`
+	Window         *rawWindow        `json:"window"`
 }
 
 type rawWindow struct {

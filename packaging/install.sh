@@ -47,6 +47,8 @@ AGENT_VERSION="${LIVCK_AGENT_VERSION:-latest}"
 
 BINARY_PATH="/usr/bin/livck-agent"
 UNIT_PATH="/usr/lib/systemd/system/livck-agent.service"
+UPDATE_UNIT_PATH="/usr/lib/systemd/system/livck-agent-update.service"
+UPDATE_TIMER_PATH="/usr/lib/systemd/system/livck-agent-update.timer"
 STATE_DIR="/var/lib/livck-agent"
 CONFIG_DIR="/etc/livck-agent"
 USER_NAME="livck-agent"
@@ -196,6 +198,37 @@ UNIT
             || die 1 "could not fetch the systemd unit; install the deb/rpm package instead"
     fi
     chmod 0644 "$UNIT_PATH"
+
+    write_update_units
+}
+
+# Auto-update timer pair (root oneshot; the sandboxed daemon never swaps its own
+# binary). Same one-source-of-truth mechanics as the main unit: get.livck.cloud
+# substitutes the placeholders; run straight from source we fetch instead.
+# Best-effort: a missing update unit must never fail the INSTALL (the agent
+# still runs; upgrades can be done manually with `livck-agent upgrade`).
+write_update_units() {
+    cat > "$UPDATE_UNIT_PATH" <<'UNIT'
+{{SYSTEMD_UPDATE_SERVICE}}
+UNIT
+    if grep -qF '{{SYSTEMD_UPDATE_SERVICE}}' "$UPDATE_UNIT_PATH" 2>/dev/null; then
+        curl_to "$DOWNLOAD_BASE/livck-agent-update.service" "$UPDATE_UNIT_PATH" || {
+            warn "could not fetch the update service unit; auto-update disabled (manual: livck-agent upgrade)"
+            rm -f "$UPDATE_UNIT_PATH"
+            return 0
+        }
+    fi
+    cat > "$UPDATE_TIMER_PATH" <<'UNIT'
+{{SYSTEMD_UPDATE_TIMER}}
+UNIT
+    if grep -qF '{{SYSTEMD_UPDATE_TIMER}}' "$UPDATE_TIMER_PATH" 2>/dev/null; then
+        curl_to "$DOWNLOAD_BASE/livck-agent-update.timer" "$UPDATE_TIMER_PATH" || {
+            warn "could not fetch the update timer unit; auto-update disabled (manual: livck-agent upgrade)"
+            rm -f "$UPDATE_UNIT_PATH" "$UPDATE_TIMER_PATH"
+            return 0
+        }
+    fi
+    chmod 0644 "$UPDATE_UNIT_PATH" "$UPDATE_TIMER_PATH"
 }
 
 pick_nologin() {
@@ -383,6 +416,12 @@ main() {
     # ---- enable + start -----------------------------------------------------
     log "enabling and starting $SERVICE"
     systemctl enable --now "$SERVICE" >&2
+
+    # Auto-update timer: default-on; the panel's autoupdate flag gates the actual
+    # work. Hard host-side opt-out: systemctl disable --now livck-agent-update.timer
+    if [ -f "$UPDATE_TIMER_PATH" ]; then
+        systemctl enable --now livck-agent-update.timer >/dev/null 2>&1 || :
+    fi
 
     log "done. Check status with: systemctl status $SERVICE"
     exit 0

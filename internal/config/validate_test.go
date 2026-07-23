@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const fullDoc = `{
   "config_version": 7,
@@ -161,13 +164,41 @@ func TestValidateTargetVersionAndWindow(t *testing.T) {
 }
 
 func TestValidateLimitsClamp(t *testing.T) {
-	doc := `{"config_version":1,"limits":{"max_keys_per_report":500,"max_reports_per_batch":999}}`
+	doc := `{"config_version":1,"limits":{"max_keys_per_report":99999,"max_reports_per_batch":999}}`
 	cfg, _, err := Validate([]byte(doc))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Limits.MaxKeysPerReport != maxKeysCeil || cfg.Limits.MaxReportsPerBatch != maxReportsCeil {
 		t.Fatalf("limits not clamped: %+v", cfg.Limits)
+	}
+
+	// A server-sent value inside the ceiling passes through verbatim.
+	doc = `{"config_version":1,"limits":{"max_keys_per_report":500}}`
+	cfg, _, err = Validate([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.MaxKeysPerReport != 500 {
+		t.Fatalf("in-range limit altered: %+v", cfg.Limits)
+	}
+}
+
+func TestValidateUpdateArtifactDigests(t *testing.T) {
+	doc := `{"config_version":1,"update":{"target_version":"v0.2.0","artifact_sha256":{` +
+		`"amd64":"` + strings.Repeat("a", 64) + `","arm64":"NOT-HEX","":"` + strings.Repeat("b", 64) + `"}}}`
+	cfg, issues, err := Validate([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Update.ArtifactSHA256["amd64"] != strings.Repeat("a", 64) {
+		t.Fatalf("valid digest dropped: %+v", cfg.Update.ArtifactSHA256)
+	}
+	if _, ok := cfg.Update.ArtifactSHA256["arm64"]; ok {
+		t.Fatal("non-hex digest accepted")
+	}
+	if !hasField(issues, "update.artifact_sha256.arm64") {
+		t.Fatal("invalid digest did not raise an issue")
 	}
 }
 

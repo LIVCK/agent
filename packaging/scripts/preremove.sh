@@ -19,6 +19,7 @@ fi
 
 case "$action" in
     "remove")
+        systemctl disable --now livck-agent-update.timer >/dev/null 2>&1 || :
         systemctl disable --now "$SERVICE" >/dev/null 2>&1 || :
         ;;
     "upgrade")

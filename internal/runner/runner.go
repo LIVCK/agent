@@ -16,6 +16,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"sort"
 	"strings"
@@ -55,6 +56,12 @@ type Options struct {
 	Lifecycle     Lifecycle
 	ConfigTrigger chan struct{}
 	Log           *slog.Logger
+	// UpdateResultPath is the upgrade CLI's result file (STATE_DIR/update-result.json).
+	// When its content changes (a new upgrade ran — including the restart that
+	// follows a successful one) the outcome rides the next report's meta as the
+	// updater heartbeat (updater_last_run_at/updater_last_result → the §16
+	// rollout-halt criteria). Empty disables the check.
+	UpdateResultPath string
 	// CollectTimeout bounds ONE cheap (sub-sampled) collector's collect call.
 	// Zero uses a default. Cheap collectors read /proc and finish in well under a
 	// millisecond, so this stays short.
@@ -75,6 +82,11 @@ type Options struct {
 type Runner struct {
 	opt Options
 	log *slog.Logger
+
+	// lastUpdateResult is the raw result-file content already reported, so the
+	// heartbeat rides exactly one report per upgrade run (plus one on process
+	// start, which is wanted: the post-upgrade restart reports the fresh result).
+	lastUpdateResult string
 }
 
 // New builds a Runner.
@@ -257,11 +269,57 @@ func (r *Runner) enqueue(rep *wire.Report) {
 // The host-profile meta is NOT attached here — the sender decorates the first
 // report of each batch until a 202 confirms delivery (assemble-time marking lost
 // the profile when the carrying report was evicted during a long ingest outage).
+// The updater heartbeat, by contrast, IS attached here: it is per-run news, and
+// the sender MERGES report meta with the profile, so both coexist.
 func (r *Runner) assembleReport(agg *aggregator, maxKeys int) *wire.Report {
-	return &wire.Report{
+	rep := &wire.Report{
 		SampledAtUnixMs: r.opt.Platform.Clock.Now().UnixMilli(),
 		Metrics:         capKeys(agg.collapse(), maxKeys),
 	}
+	if meta := r.updaterHeartbeat(); meta != nil {
+		rep.Meta = meta
+	}
+	return rep
+}
+
+// updaterHeartbeat surfaces a CHANGED update-result.json as report meta. The
+// keys mirror the service_agents columns the consumer persists them into. A
+// short, bounded read on the report cadence (~200 bytes, state dir) — no Stat
+// in the FS abstraction needed.
+func (r *Runner) updaterHeartbeat() map[string]string {
+	if r.opt.UpdateResultPath == "" {
+		return nil
+	}
+	raw, err := r.opt.Platform.FS.ReadFile(r.opt.UpdateResultPath)
+	if err != nil || len(raw) == 0 || len(raw) > 4096 {
+		return nil
+	}
+	content := string(raw)
+	if content == r.lastUpdateResult {
+		return nil
+	}
+
+	var res struct {
+		FinishedAt string `json:"finished_at"`
+		Outcome    string `json:"outcome"`
+		ManagedBy  string `json:"managed_by"`
+	}
+	if json.Unmarshal(raw, &res) != nil || res.Outcome == "" {
+		r.lastUpdateResult = content // poison file: never re-parse it every report
+		return nil
+	}
+	r.lastUpdateResult = content
+
+	meta := map[string]string{
+		"updater_last_result": res.Outcome,
+	}
+	if res.FinishedAt != "" {
+		meta["updater_last_run_at"] = res.FinishedAt
+	}
+	if res.ManagedBy != "" {
+		meta["update_managed_by"] = res.ManagedBy
+	}
+	return meta
 }
 
 // wildcardPrefixes are the per-device / per-target metric families. When a report

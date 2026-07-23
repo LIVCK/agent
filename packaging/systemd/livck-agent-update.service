@@ -1,0 +1,40 @@
+# LIVCK agent auto-update - root oneshot, fired by livck-agent-update.timer.
+#
+# The monitoring daemon (livck-agent.service) deliberately runs as a non-root,
+# heavily sandboxed user and can neither replace /usr/bin/livck-agent nor call
+# systemctl. Updates are therefore a ROOT concern, isolated in this oneshot:
+# `upgrade --auto` is a silent no-op unless the LIVCK panel's autoupdate flag is
+# on, a version is released for this host's staged-rollout group, AND the
+# host-local update window is open. Hard host-side opt-out (change management):
+#   systemctl disable --now livck-agent-update.timer
+
+[Unit]
+Description=LIVCK agent auto-update
+Documentation=https://get.livck.cloud
+# Updates need DNS + TLS; never fire into a half-up network.
+After=network-online.target
+Wants=network-online.target
+# Never race the agent's own start/stop sequences during boot/shutdown.
+After=livck-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/livck-agent upgrade --auto
+# Generous ceiling: download + dpkg + health window; a hang must not pile up
+# with the next timer firing (the state-dir flock also guards against overlap).
+TimeoutStartSec=15min
+
+# ---- Hardening (as tight as an updater can be) -------------------------------
+# NOT ProtectSystem=strict: this unit's PURPOSE is writing /usr/bin (and dpkg
+# needs /var/lib/dpkg). Everything that does not block that is enabled.
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=no
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

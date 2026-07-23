@@ -370,6 +370,23 @@ func validateUpdate(rc *rawConfig, cfg *Config, issues *[]Issue) {
 			*issues = append(*issues, Issue{"update.target_version", SeverityError, "invalid semver, ignored"})
 		}
 	}
+	if len(rc.Update.ArtifactSHA256) > 0 {
+		digests := make(map[string]string, len(rc.Update.ArtifactSHA256))
+		for arch, digest := range rc.Update.ArtifactSHA256 {
+			if arch == "" || len(arch) > 16 {
+				continue
+			}
+			d := strings.ToLower(strings.TrimSpace(digest))
+			if isSHA256Hex(d) {
+				digests[arch] = d
+			} else {
+				*issues = append(*issues, Issue{"update.artifact_sha256." + arch, SeverityError, "not a sha256 hex digest, ignored"})
+			}
+		}
+		if len(digests) > 0 {
+			cfg.Update.ArtifactSHA256 = digests
+		}
+	}
 	if rc.Update.Window != nil {
 		start, end := rc.Update.Window.Start, rc.Update.Window.End
 		if hhmmRe.MatchString(start) && hhmmRe.MatchString(end) {
@@ -380,6 +397,20 @@ func validateUpdate(rc *rawConfig, cfg *Config, issues *[]Issue) {
 			*issues = append(*issues, Issue{"update.window", SeverityError, "invalid HH:MM, using default window"})
 		}
 	}
+}
+
+// isSHA256Hex reports whether s is a 64-char lowercase hex string.
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		ok := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func validateLimits(rc *rawConfig, cfg *Config, issues *[]Issue) {

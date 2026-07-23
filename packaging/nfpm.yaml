@@ -57,6 +57,17 @@ contents:
     file_info:
       mode: 0644
 
+  # Auto-update timer pair (root oneshot; the sandboxed daemon never updates
+  # itself). Enabled by postinstall; hard opt-out = systemctl disable the timer.
+  - src: packaging/systemd/livck-agent-update.service
+    dst: /usr/lib/systemd/system/livck-agent-update.service
+    file_info:
+      mode: 0644
+  - src: packaging/systemd/livck-agent-update.timer
+    dst: /usr/lib/systemd/system/livck-agent-update.timer
+    file_info:
+      mode: 0644
+
   # Config directory (owned so rpm cleans it up on erase).
   - dst: /etc/livck-agent
     type: dir

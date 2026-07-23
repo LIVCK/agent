@@ -39,6 +39,7 @@ import (
 	"github.com/LIVCK/agent/internal/platform"
 	"github.com/LIVCK/agent/internal/runner"
 	"github.com/LIVCK/agent/internal/sender"
+	"github.com/LIVCK/agent/internal/update"
 )
 
 // version is set at build time via -ldflags "-X main.version=...".
@@ -63,6 +64,16 @@ const (
 	binaryPath  = "/usr/bin/livck-agent"
 	configDir   = "/etc/livck-agent"
 	agentUser   = "livck-agent"
+
+	// Auto-update timer pair (root oneshot; the hardened daemon never updates itself).
+	updateTimerUnit   = "livck-agent-update.timer"
+	updateServiceUnit = "livck-agent-update.service"
+	updateUnitPath    = "/usr/lib/systemd/system/livck-agent-update.service"
+	updateTimerPath   = "/usr/lib/systemd/system/livck-agent-update.timer"
+
+	// exitUpgradeAvailable is `upgrade --check`'s "a newer version is available"
+	// signal (monitoring-friendly, mirrors doctor's non-zero contract).
+	exitUpgradeAvailable = 5
 )
 
 // maxProcs caps the Go runtime's parallelism. A metric sampler is I/O-bound and
@@ -115,10 +126,12 @@ func main() {
 		os.Exit(doctorCmd(os.Args[2:]))
 	case "reset":
 		os.Exit(resetCmd(os.Args[2:]))
+	case "upgrade", "update": // "update" is an accepted alias; "upgrade" is canonical (apt semantics)
+		os.Exit(upgradeCmd(os.Args[2:]))
 	case "uninstall":
 		os.Exit(uninstallCmd(os.Args[2:]))
 	default:
-		fmt.Fprintln(os.Stderr, "livck-agent: unknown command "+cmd+" (run, enroll, reset, uninstall, doctor, version)")
+		fmt.Fprintln(os.Stderr, "livck-agent: unknown command "+cmd+" (run, enroll, upgrade, reset, uninstall, doctor, version)")
 		os.Exit(2)
 	}
 }
@@ -132,6 +145,8 @@ Usage: livck-agent <command> [options]
 Commands:
   run                    run the agent (the systemd unit calls this)
   enroll --token lve_... register this host with LIVCK (--force to re-enroll)
+  upgrade                install the released agent version (--check to inspect,
+                         --version X to pin, --force to downgrade; alias: update)
   reset                  wipe the local identity for a clean re-enroll (keeps the install)
   uninstall              stop, remove and purge the agent (--keep-data keeps state)
   doctor                 read-only self-diagnosis
@@ -434,6 +449,9 @@ func run() error {
 		Lifecycle:     lc,
 		ConfigTrigger: trigger,
 		Log:           log,
+		// Updater heartbeat: the upgrade CLI drops its outcome here; the runner
+		// reports it as meta (updater_last_* → the §16 rollout-halt criteria).
+		UpdateResultPath: filepath.Join(stateDir, update.ResultFile),
 	})
 
 	log.Info("livck-agent starting", "version", version, "instance_id", instanceID, "state_dir", stateDir,
@@ -503,6 +521,9 @@ func uninstallCmd(args []string) int {
 	}
 
 	// Stop + disable first so nothing restarts mid-teardown (best-effort).
+	// The update timer goes first — an auto-update firing mid-uninstall would race
+	// the teardown.
+	runQuiet("systemctl", "disable", "--now", updateTimerUnit)
 	runQuiet("systemctl", "disable", "--now", serviceUnit)
 
 	switch {
@@ -529,8 +550,11 @@ func uninstallCmd(args []string) int {
 	default:
 		fmt.Println("livck-agent: removing the raw-binary install...")
 		_ = os.Remove(unitPath)
+		_ = os.Remove(updateUnitPath)
+		_ = os.Remove(updateTimerPath)
 		runQuiet("systemctl", "daemon-reload")
-		_ = os.Remove(binaryPath) // safe while running: Linux keeps the open inode
+		_ = os.Remove(binaryPath)          // safe while running: Linux keeps the open inode
+		_ = os.Remove(binaryPath + ".old") // upgrade rollback slot
 		if !*keepData {
 			purgeState()
 		}

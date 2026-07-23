@@ -50,6 +50,12 @@ create_user() {
 create_user
 systemctl daemon-reload >/dev/null 2>&1 || :
 
+# Auto-update timer: enabled by default (the panel's autoupdate flag gates the
+# actual work; `upgrade --auto` is a no-op when it is off). Host-side hard
+# opt-out for change-managed environments:
+#   systemctl disable --now livck-agent-update.timer
+systemctl enable --now livck-agent-update.timer >/dev/null 2>&1 || :
+
 case "$action" in
     "1"|"install")
         # Clean install: unit is on disk but stays stopped/disabled until enroll.

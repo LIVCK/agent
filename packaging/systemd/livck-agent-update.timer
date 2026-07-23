@@ -1,0 +1,22 @@
+# LIVCK agent auto-update timer.
+#
+# Fires hourly with a full-hour random offset: the offset is FIXED per host
+# (stable cohort spreading), so a fleet never stampedes the distribution host in
+# lockstep - and the actual update window/flag gating happens inside
+# `upgrade --auto` against the server-provided config (panel-controlled).
+# Hard host-side opt-out: systemctl disable --now livck-agent-update.timer
+
+[Unit]
+Description=Hourly LIVCK agent auto-update check
+Documentation=https://get.livck.cloud
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=3600
+FixedRandomDelay=true
+# Catch up after downtime (a host that slept through its window still updates
+# on the next boot instead of drifting stale for weeks).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

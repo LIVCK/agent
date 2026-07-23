@@ -327,8 +327,17 @@ func (s *Sender) attempt(ctx context.Context, p *pending) (response, error) {
 	}
 	if p.carriedMeta && len(p.reports) > 0 {
 		// Decorate (idempotent under retries): the profile rides the first report
-		// of the batch, mark-after-202 in onAccepted.
-		p.reports[0].Meta = s.opt.Meta
+		// of the batch, mark-after-202 in onAccepted. MERGED under any meta the
+		// report already carries (the runner's updater heartbeat) — report-level
+		// keys win, and s.opt.Meta itself is never mutated.
+		merged := make(map[string]string, len(s.opt.Meta)+len(p.reports[0].Meta))
+		for k, v := range s.opt.Meta {
+			merged[k] = v
+		}
+		for k, v := range p.reports[0].Meta {
+			merged[k] = v
+		}
+		p.reports[0].Meta = merged
 	}
 	body, err := s.enc.encode(batch)
 	if err != nil {

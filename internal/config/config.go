@@ -49,8 +49,13 @@ const (
 	netMaxIfacesCeil     = 10
 	maxSystemdUnits      = 10
 	maxSystemdUnitLen    = 256
-	maxKeysCeil          = 120
-	maxReportsCeil       = 200
+	// maxKeysCeil mirrors AgentMetricCaps::MAX_KEYS (config limits.max_keys_per_report)
+	// and pulse's DefaultMaxKeys. It must stay ABOVE the worst-case legitimate
+	// emission (~589 keys with every family cap maxed) — capKeys sheds against THIS
+	// value before pulse ever sees a report, so a stale 120 silently cut whole
+	// families (probes/SMART) on well-equipped hosts.
+	maxKeysCeil    = 640
+	maxReportsCeil = 200
 
 	// Reachability probe bounds. The target count is capped server-side too; this is the agent's
 	// defensive ceiling. Interval is separate from the report interval so probes stay light.
@@ -159,12 +164,18 @@ type SystemdFeature struct {
 }
 
 // UpdateConfig holds the update channel. TargetVersion is empty unless the
-// server has released this agent's rollout group. v1 is advertise-only.
+// server has released this agent's rollout group. The `livck-agent upgrade`
+// CLI (root) consumes it; the daemon itself never self-updates.
 type UpdateConfig struct {
 	Autoupdate    bool
 	TargetVersion string
-	WindowStart   string
-	WindowEnd     string
+	// ArtifactSHA256 pins the release artifact digest per Go arch (amd64/arm64)
+	// when the rollout ledger carries one — the upgrade CLI then verifies the
+	// download against the SERVER-pinned digest instead of the same-origin
+	// .sha256 file (defeats a mutable-release-asset swap).
+	ArtifactSHA256 map[string]string
+	WindowStart    string
+	WindowEnd      string
 }
 
 // LimitsConfig holds the per-report and per-batch caps.
