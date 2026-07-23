@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // FS abstracts the pieces of the filesystem the agent needs: reading and
@@ -59,10 +60,36 @@ func (OSFS) WriteFileAtomic(name string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp: %w", err)
 	}
+	// When running as root (a manual `enroll`/`run`), inherit the STATE DIRECTORY's
+	// ownership instead of leaving the file root-owned. systemd runs the agent as the
+	// unpriviledged `livck-agent` user; a root-written, root-owned 0600 token/identity
+	// would then be UNREADABLE by the service — which surfaces as a 401 auth loop after
+	// a manual re-enroll (the service keeps failing until the file is re-chowned).
+	// Best-effort and a no-op when we are not root or the state dir is root-owned too.
+	chownToDirOwner(tmpName, dir)
 	if err := os.Rename(tmpName, name); err != nil {
 		return fmt.Errorf("rename temp: %w", err)
 	}
 	return nil
+}
+
+// chownToDirOwner chowns file to the uid/gid that owns dir, but only when the
+// process is root and the target owner differs from root. It is best-effort:
+// any failure (non-root, unreadable dir, unsupported platform) leaves the file
+// as-is, so a write never fails merely because ownership could not be adjusted.
+func chownToDirOwner(file, dir string) {
+	if os.Geteuid() != 0 {
+		return
+	}
+	di, err := os.Stat(dir)
+	if err != nil {
+		return
+	}
+	st, ok := di.Sys().(*syscall.Stat_t)
+	if !ok || (st.Uid == 0 && st.Gid == 0) {
+		return
+	}
+	_ = os.Chown(file, int(st.Uid), int(st.Gid))
 }
 
 // Remove removes the named file. A missing file is not an error.
