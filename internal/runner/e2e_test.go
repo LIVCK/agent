@@ -258,6 +258,7 @@ func newE2E(t *testing.T, o e2eOpts) *e2eFixture {
 		TokenFn:      func() string { return "lvk_test" },
 		InstanceID:   "11111111-1111-4111-8111-111111111111",
 		AgentVersion: "0.0.0-e2e",
+		Meta:         map[string]string{"os": "linux", "hostname": "e2e-host"},
 		Clock:        senderClock,
 		Buffer:       ring,
 		Events:       queue,
@@ -287,7 +288,6 @@ func newE2E(t *testing.T, o e2eOpts) *e2eFixture {
 		Sender:        sndr,
 		Spool:         spool,
 		ConfigTrigger: trigger,
-		Meta:          map[string]string{"os": "linux", "hostname": "e2e-host"},
 		Log:           discardLogger(),
 	})
 	return &e2eFixture{runner: r, ing: ing, ring: ring, spool: spool, fs: fs, cfg: cfg, senderClock: senderClock}

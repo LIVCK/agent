@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -29,9 +30,17 @@ const (
 	// defaultIdlePoll is how often the supervisor re-checks features.live while
 	// the feature is off. Cheap: one atomic config read.
 	defaultIdlePoll = 3 * time.Second
-	// defaultBackoff paces reconnects after a dial or write failure while live
-	// stays on, so a flapping endpoint is not hammered.
+	// defaultBackoff is the FLOOR reconnect delay after a dial or write failure
+	// while live stays on. Consecutive failures double it (full jitter) up to
+	// backoffCap — live can be left enabled fleet-wide (auto-disable-on-last-
+	// viewer is deferred), so a flat 2 s would have every affected agent redial
+	// TLS every 2 s for the whole duration of a pulse outage.
 	defaultBackoff = 2 * time.Second
+	// backoffCap bounds the exponential reconnect ladder.
+	backoffCap = 60 * time.Second
+	// sessionResetAfter: a session that stayed up this long counts as healthy,
+	// so the next failure starts the ladder from the floor again.
+	sessionResetAfter = 30 * time.Second
 )
 
 // Conn is one open signal channel to pulse. WriteText sends a burst frame; a
@@ -67,6 +76,9 @@ type Options struct {
 	Interval time.Duration
 	IdlePoll time.Duration
 	Backoff  time.Duration
+	// Jitter maps an exclusive ceiling to a random value in [0, n) — full-jitter
+	// backoff (same contract as the sender's). Defaults to math/rand.
+	Jitter func(n int64) int64
 }
 
 // Streamer supervises the signal channel lifecycle against features.live.
@@ -96,7 +108,23 @@ func New(opt Options) *Streamer {
 	if opt.Backoff <= 0 {
 		opt.Backoff = defaultBackoff
 	}
+	if opt.Jitter == nil {
+		opt.Jitter = rand.Int63n
+	}
 	return &Streamer{opt: opt, log: opt.Log}
+}
+
+// nextBackoff returns the full-jitter delay for the given failure streak and
+// advances it: uniform in [0, min(Backoff<<attempt, backoffCap)].
+func (s *Streamer) nextBackoff(attempt *uint) time.Duration {
+	ceiling := s.opt.Backoff << *attempt
+	if ceiling <= 0 || ceiling > backoffCap {
+		ceiling = backoffCap
+	}
+	if *attempt < 16 {
+		*attempt++
+	}
+	return time.Duration(s.opt.Jitter(int64(ceiling) + 1))
 }
 
 // Run supervises the channel until ctx is done. While features.live is off it
@@ -104,6 +132,7 @@ func New(opt Options) *Streamer {
 // backoff after any failure. A clean live-off transition closes the channel and
 // returns to idle without an error.
 func (s *Streamer) Run(ctx context.Context) {
+	var attempt uint
 	for {
 		if ctx.Err() != nil {
 			return
@@ -115,11 +144,18 @@ func (s *Streamer) Run(ctx context.Context) {
 			}
 			continue
 		}
+		started := s.opt.Clock.Now()
 		if err := s.session(ctx); err != nil && ctx.Err() == nil {
-			s.log.Debug("live session ended, will reconnect", "err", err.Error())
-			if berr := s.opt.Clock.Sleep(ctx, s.opt.Backoff); berr != nil {
+			if s.opt.Clock.Now().Sub(started) >= sessionResetAfter {
+				attempt = 0
+			}
+			delay := s.nextBackoff(&attempt)
+			s.log.Debug("live session ended, will reconnect", "err", err.Error(), "delay", delay.String())
+			if berr := s.opt.Clock.Sleep(ctx, delay); berr != nil {
 				return
 			}
+		} else {
+			attempt = 0
 		}
 	}
 }

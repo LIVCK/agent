@@ -114,6 +114,7 @@ func newRunnerFixture(t *testing.T, status int) *runnerFixture {
 		TokenFn:      func() string { return "lvk_test" },
 		InstanceID:   "11111111-1111-4111-8111-111111111111",
 		AgentVersion: "0.0.0-test",
+		Meta:         map[string]string{"os": "linux", "hostname": "test-host"},
 		Clock:        plat.Clock,
 		Buffer:       ring,
 		Events:       queue,
@@ -136,7 +137,6 @@ func newRunnerFixture(t *testing.T, status int) *runnerFixture {
 		Sender:        sndr,
 		Spool:         spool,
 		ConfigTrigger: make(chan struct{}, 1),
-		Meta:          map[string]string{"os": "linux", "hostname": "test-host"},
 	})
 	return &runnerFixture{runner: r, rec: rec, fs: fs, ring: ring, spool: spool}
 }

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/LIVCK/agent/internal/collector"
 	"github.com/LIVCK/agent/internal/platform"
 )
 
@@ -13,6 +14,16 @@ const (
 	drmDir    = "/sys/class/drm"
 	amdVendor = "0x1002"
 )
+
+// pciIDsPaths lists the standard host locations of the PCI ID database, tried in
+// order. AMD has no nvidia-smi equivalent that prints a model name, so the name
+// is resolved from the card's PCI vendor:device against this file. It is a pure
+// read — the agent never installs it — so a host without hwdata simply yields no
+// AMD names (the console falls back to an ordinal label).
+var pciIDsPaths = []string{
+	"/usr/share/hwdata/pci.ids",
+	"/usr/share/misc/pci.ids",
+}
 
 // cardRe matches a real DRM card node (card0, card1, ...) and excludes the
 // connector sub-nodes (card0-DP-1) that also live under /sys/class/drm.
@@ -139,4 +150,116 @@ func readSysFloat(fs platform.FS, path string) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// QueryAMDNames returns a normalized-PCI → product-name map for the present AMD
+// GPUs (e.g. "0000_28_00.0" → "Navi 31 [Radeon RX 7900 XTX/...]"). AMD has no
+// nvidia-smi equivalent, so each card's model is resolved from its PCI
+// vendor:device (sysfs device/vendor + device/device) against the host pci.ids
+// database. It mirrors the NVIDIA QueryNames seeding path so an AMD card reads as
+// a model name instead of a bare PCI address in the "Devices" panel. Best-effort:
+// returns nil when no AMD card is present or pci.ids is absent, and a card whose
+// id is not in the database is simply omitted (never fatal, like NVIDIA's
+// nil-on-absence).
+func QueryAMDNames(fs platform.FS) map[string]string {
+	if fs == nil {
+		return nil
+	}
+	c := &Collector{fs: fs}
+	cards := c.amdCards()
+	if len(cards) == 0 {
+		return nil
+	}
+	db := readPCIIDs(fs)
+	if db == nil {
+		return nil
+	}
+	names := make(map[string]string)
+	for _, name := range cards {
+		dev := drmDir + "/" + name + "/device"
+		pci := c.readPCISlot(dev)
+		if pci == "" {
+			continue
+		}
+		vendor := normalizeHexID(c.readString(dev + "/vendor"))
+		device := normalizeHexID(c.readString(dev + "/device"))
+		if vendor == "" || device == "" {
+			continue
+		}
+		if model := resolvePCIName(db, vendor, device); model != "" {
+			names[collector.NormalizeSegment(pci)] = model
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// readPCIIDs loads the first available host pci.ids database, or nil when none
+// exists (the name lookup then yields nothing, best-effort).
+func readPCIIDs(fs platform.FS) []byte {
+	for _, p := range pciIDsPaths {
+		if data, err := fs.ReadFile(p); err == nil && len(data) > 0 {
+			return data
+		}
+	}
+	return nil
+}
+
+// normalizeHexID turns a sysfs PCI id file body ("0x1002\n") into the bare,
+// lowercase 4-hex-digit form ("1002") pci.ids uses. Returns "" for an empty body.
+func normalizeHexID(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	return strings.TrimPrefix(s, "0x")
+}
+
+// resolvePCIName scans a pci.ids database body for the model name of a
+// vendor:device pair (both bare, lowercase hex, e.g. "1002", "13c0"). The file is
+// flat and tab-indented: a vendor line has no leading tab, its device lines carry
+// one leading tab, and per-device subsystem lines carry two. It walks into the
+// matching vendor stanza, returns the matching device's name, and stops at the
+// next vendor line (or end) — returning "" when either is not found.
+func resolvePCIName(db []byte, vendor, device string) string {
+	inVendor := false
+	for _, line := range strings.Split(string(db), "\n") {
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		if line[0] != '\t' {
+			if inVendor {
+				return "" // left the vendor stanza without a device match
+			}
+			if id, _, ok := cutPCIEntry(line); ok && id == vendor {
+				inVendor = true
+			}
+			continue
+		}
+		if !inVendor {
+			continue
+		}
+		if strings.HasPrefix(line, "\t\t") {
+			continue // subsystem line, not a device
+		}
+		if id, name, ok := cutPCIEntry(line[1:]); ok && id == device {
+			return name
+		}
+	}
+	return ""
+}
+
+// cutPCIEntry splits one pci.ids entry ("id  name": a hex id, two spaces, the
+// name) into its id and name. It reports ok=false when the line lacks the
+// two-space separator or either half is empty.
+func cutPCIEntry(line string) (id, name string, ok bool) {
+	id, name, found := strings.Cut(line, "  ")
+	if !found {
+		return "", "", false
+	}
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	if id == "" || name == "" {
+		return "", "", false
+	}
+	return id, name, true
 }

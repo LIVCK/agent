@@ -224,6 +224,75 @@ func TestAMDMissingAttributesOmitted(t *testing.T) {
 	}
 }
 
+// amdNameFS builds a MemFS with one AMD card (vendor 0x1002) whose PCI slot and
+// device id are set, so QueryAMDNames can resolve a name. deviceID is the bare
+// 4-hex-digit id written as "0x<id>" into device/device.
+func amdNameFS(pciSlot, deviceID string) *platformtest.MemFS {
+	fs := platformtest.NewMemFS()
+	dev := drmDir + "/card0/device"
+	fs.WriteFileAtomic(dev+"/vendor", []byte("0x1002\n"), 0o600)
+	fs.WriteFileAtomic(dev+"/device", []byte("0x"+deviceID+"\n"), 0o600)
+	fs.WriteFileAtomic(dev+"/gpu_busy_percent", []byte("42\n"), 0o600)
+	fs.WriteFileAtomic(dev+"/uevent", []byte("DRIVER=amdgpu\nPCI_SLOT_NAME="+pciSlot+"\n"), 0o600)
+	return fs
+}
+
+// pciIDsFixture is a minimal pci.ids body: the vendor stanza carries a device
+// with a preceding sibling device that itself has a subsystem line, so the parse
+// exercises the device-scan, the two-tab subsystem skip, and the vendor-boundary.
+const pciIDsFixture = "# comment header\n" +
+	"1002  Advanced Micro Devices, Inc. [AMD/ATI]\n" +
+	"\t744c  Navi 31\n" +
+	"\t\t1849 5333  Radeon RX 7900 XTX\n" +
+	"\t13c0  Navi 31 [Radeon RX 7900 XTX/7900 XT]\n" +
+	"10de  NVIDIA Corporation\n" +
+	"\t2684  AD102 [GeForce RTX 4090]\n"
+
+func TestQueryAMDNamesResolvesFromPCIIDs(t *testing.T) {
+	fs := amdNameFS("0000:28:00.0", "13c0")
+	fs.WriteFileAtomic("/usr/share/hwdata/pci.ids", []byte(pciIDsFixture), 0o600)
+
+	names := QueryAMDNames(fs)
+	if got := names["0000_28_00.0"]; got != "Navi 31 [Radeon RX 7900 XTX/7900 XT]" {
+		t.Fatalf("amd 28:00.0 name = %q, want Navi 31 [Radeon RX 7900 XTX/7900 XT]", got)
+	}
+}
+
+func TestQueryAMDNamesFallbackDatabasePath(t *testing.T) {
+	fs := amdNameFS("0000:28:00.0", "13c0")
+	// Only the /usr/share/misc fallback exists, not the primary hwdata path.
+	fs.WriteFileAtomic("/usr/share/misc/pci.ids", []byte(pciIDsFixture), 0o600)
+
+	if got := QueryAMDNames(fs)["0000_28_00.0"]; got != "Navi 31 [Radeon RX 7900 XTX/7900 XT]" {
+		t.Fatalf("name via fallback path = %q, want resolved", got)
+	}
+}
+
+func TestQueryAMDNamesAbsentDatabaseReturnsNil(t *testing.T) {
+	fs := amdNameFS("0000:28:00.0", "13c0")
+	// No pci.ids anywhere: best-effort yields nothing, never fatal.
+	if names := QueryAMDNames(fs); names != nil {
+		t.Fatalf("want nil when pci.ids is absent, got %v", names)
+	}
+}
+
+func TestQueryAMDNamesUnknownDeviceOmitted(t *testing.T) {
+	fs := amdNameFS("0000:28:00.0", "9999") // vendor 1002 present, device not in stanza
+	fs.WriteFileAtomic("/usr/share/hwdata/pci.ids", []byte(pciIDsFixture), 0o600)
+
+	if names := QueryAMDNames(fs); names != nil {
+		t.Fatalf("want nil when the device id is not in pci.ids, got %v", names)
+	}
+}
+
+func TestQueryAMDNamesNoCardReturnsNil(t *testing.T) {
+	fs := platformtest.NewMemFS()
+	fs.WriteFileAtomic("/usr/share/hwdata/pci.ids", []byte(pciIDsFixture), 0o600)
+	if names := QueryAMDNames(fs); names != nil {
+		t.Fatalf("want nil when no AMD card is present, got %v", names)
+	}
+}
+
 func TestFeatureOffNotAvailable(t *testing.T) {
 	fs := nvidiaFS()
 	c := New(fs, nvidiaExec("0, GPU, 00000000:65:00.0, 10, 1, 2, 40, 30\n"), cfgGPU(false))

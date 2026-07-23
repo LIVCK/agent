@@ -348,6 +348,13 @@ func run() error {
 
 	trigger := make(chan struct{}, 1)
 
+	// Host-profile meta for the sender (decorates the first report of each batch
+	// until a 202 confirms it). Built here so the map reference can be wired into
+	// the sender; the GPU/SMART display names are added below (they need the run
+	// ctx for their one-shot forks) — safe, the sender loop only starts inside
+	// r.Run after that block.
+	hostMeta := hostinfo.Meta(plat)
+
 	sndr, err := sender.New(sender.Options{
 		Client:       client,
 		URL:          ingestURL,
@@ -362,6 +369,7 @@ func run() error {
 		NewID:        uuid.NewString,
 		Log:          log,
 		Fingerprint:  hostinfo.Fingerprint(plat),
+		Meta:         hostMeta,
 		OnConfigVersion: func(uint32) {
 			select {
 			case trigger <- struct{}{}:
@@ -396,8 +404,15 @@ func run() error {
 	// Seed the report meta with human-readable GPU model names (nvidia-smi, forked ONCE). They ride the
 	// bootstrap meta → service_agents.meta → the detail "Devices" panel, so a card reads
 	// "NVIDIA GeForce RTX 4080" instead of a bare PCI address. Best-effort: absent on non-NVIDIA hosts.
-	hostMeta := hostinfo.Meta(plat)
 	for pci, name := range gpu.QueryNames(ctx, plat.Exec) {
+		hostMeta["gpu."+pci+".name"] = name
+	}
+	// AMD cards have no nvidia-smi equivalent, so their model is resolved from the
+	// host pci.ids database via each card's sysfs PCI vendor:device. Same meta key
+	// shape, so the console renders "Radeon ..." instead of a bare PCI address.
+	// Best-effort: absent on hosts without pci.ids (covered by the console's
+	// ordinal fallback).
+	for pci, name := range gpu.QueryAMDNames(plat.FS) {
 		hostMeta["gpu."+pci+".name"] = name
 	}
 	// Same idea for SMART drives: the model name (nvme0 → "Samsung SSD 9100 PRO 2TB") rides the meta
@@ -418,7 +433,6 @@ func run() error {
 		Spool:         spool,
 		Lifecycle:     lc,
 		ConfigTrigger: trigger,
-		Meta:          hostMeta,
 		Log:           log,
 	})
 

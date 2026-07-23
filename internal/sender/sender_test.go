@@ -344,3 +344,40 @@ func seqID() func() string {
 		return "key-" + time.Duration(v).String()
 	}
 }
+
+func TestSenderMetaRidesUntilAccepted(t *testing.T) {
+	// The host profile must survive a failed first batch (the old assemble-time
+	// flag burned it even when the carrying report never reached ingest) and must
+	// NOT be re-sent after a 202 confirmed it.
+	f := newFixture(t,
+		[]int{503, 202, 202},
+		[]string{`{"error":{"code":"RETRY_LATER"}}`, `{"status":"ok"}`, `{"status":"ok"}`},
+		func(o *Options) { o.Meta = map[string]string{"hostname": "meta-host", "os": "linux"} })
+	addReport(f.ring, f.clock.Now().UnixMilli())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go f.sender.Run(ctx)
+
+	waitFor(t, func() bool { return f.ring.Len() == 0 }, "ring drained after retry")
+
+	// Second wave: a fresh report after the profile was delivery-confirmed.
+	addReport(f.ring, f.clock.Now().UnixMilli()+1000)
+	f.sender.Wake()
+	waitFor(t, func() bool { return f.server.count() >= 3 }, "post-meta batch delivered")
+	cancel()
+
+	batches := f.server.allBatches()
+	if len(batches) < 3 {
+		t.Fatalf("want 3 batches, got %d", len(batches))
+	}
+	if batches[0].Reports[0].Meta["hostname"] != "meta-host" {
+		t.Fatal("failed first attempt must still carry the host meta")
+	}
+	if batches[1].Reports[0].Meta["hostname"] != "meta-host" {
+		t.Fatal("retried batch lost the host meta before any 202 confirmed it")
+	}
+	if len(batches[2].Reports[0].Meta) != 0 {
+		t.Fatalf("meta must stop riding after a 202 confirmed it, got %+v", batches[2].Reports[0].Meta)
+	}
+}

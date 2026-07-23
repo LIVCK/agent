@@ -54,10 +54,7 @@ type Options struct {
 	Spool         *buffer.Spool
 	Lifecycle     Lifecycle
 	ConfigTrigger chan struct{}
-	// Meta is the report-level host profile sent on the bootstrap report and the
-	// first regular report. A2 fills the full profile; A1 sends hostname and os.
-	Meta map[string]string
-	Log  *slog.Logger
+	Log           *slog.Logger
 	// CollectTimeout bounds ONE cheap (sub-sampled) collector's collect call.
 	// Zero uses a default. Cheap collectors read /proc and finish in well under a
 	// millisecond, so this stays short.
@@ -76,9 +73,8 @@ type Options struct {
 
 // Runner owns the collect loop and shutdown spool.
 type Runner struct {
-	opt      Options
-	log      *slog.Logger
-	metaSent bool
+	opt Options
+	log *slog.Logger
 }
 
 // New builds a Runner.
@@ -258,18 +254,14 @@ func (r *Runner) enqueue(rep *wire.Report) {
 // assembleReport collapses the aggregator into one wire report, caps the key
 // count, and stamps sampled_at at the END of the aggregation window (the current
 // wall-clock, giving monotone ordering and correct rollup-bucket assignment).
-// Meta rides the bootstrap report and the first regular report only.
+// The host-profile meta is NOT attached here — the sender decorates the first
+// report of each batch until a 202 confirms delivery (assemble-time marking lost
+// the profile when the carrying report was evicted during a long ingest outage).
 func (r *Runner) assembleReport(agg *aggregator, maxKeys int) *wire.Report {
-	metrics := capKeys(agg.collapse(), maxKeys)
-	rep := &wire.Report{
+	return &wire.Report{
 		SampledAtUnixMs: r.opt.Platform.Clock.Now().UnixMilli(),
-		Metrics:         metrics,
+		Metrics:         capKeys(agg.collapse(), maxKeys),
 	}
-	if !r.metaSent && len(r.opt.Meta) > 0 {
-		rep.Meta = r.opt.Meta
-		r.metaSent = true
-	}
-	return rep
 }
 
 // wildcardPrefixes are the per-device / per-target metric families. When a report

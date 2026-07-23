@@ -57,6 +57,12 @@ type Options struct {
 	// Fingerprint is attached to batches until the first 202 (and re-attached
 	// when it changes). May be nil.
 	Fingerprint map[string]string
+	// Meta is the host profile (hostinfo.Meta). It decorates the first report of
+	// every batch until a batch that carried it gets a 202 — delivery-confirmed,
+	// unlike the old assemble-time flag, which lost the profile for the whole
+	// process lifetime when the bootstrap report was evicted from the ring
+	// during a long initial ingest outage. May be nil.
+	Meta map[string]string
 	// OnConfigVersion is called when a 202 advertises a newer config version.
 	OnConfigVersion func(v uint32)
 
@@ -80,7 +86,11 @@ type Sender struct {
 	quarantineFloor time.Duration
 	jitter          jitterFn
 
-	fpSent bool
+	fpSent   bool
+	metaSent bool
+	// skewWarned dedupes the 422 clock-skew alarm to one event per skew episode
+	// (reset by the next accepted batch).
+	skewWarned bool
 }
 
 // New builds a Sender.
@@ -144,6 +154,7 @@ type pending struct {
 	events             []event.Event
 	eventIDs           []string
 	carriedFingerprint bool
+	carriedMeta        bool
 }
 
 // Run drives delivery until ctx is done. It holds a batch across retries so the
@@ -187,6 +198,20 @@ func (s *Sender) Run(ctx context.Context) {
 			b.reset()
 		case outcomeDrop:
 			s.log.Warn("batch rejected, discarding", "status", resp.status, "code", resp.errorCode)
+			// A 422 CLOCK_SKEW discard is SILENT permanent data loss while the host
+			// clock stays broken — raise it once per episode: a loud log line plus
+			// the clock_skew_detected event (queued, so it reaches the timeline with
+			// the first batch that goes through once the clock is fixed). The 202
+			// path can never see this case (skew batches never get a 202).
+			if resp.errorCode == "CLOCK_SKEW" && !s.skewWarned {
+				s.skewWarned = true
+				s.log.Error("host clock skew exceeds the ingest window — ALL metric batches are being discarded until the clock is fixed (check NTP/chrony)")
+				if s.opt.Emitter != nil {
+					s.opt.Emitter.Emit(wire.EventType_EVENT_TYPE_CLOCK_SKEW_DETECTED, map[string]string{
+						"reason": "batch_rejected",
+					})
+				}
+			}
 			s.opt.Buffer.Remove(p.seqs)
 			s.opt.Events.Remove(p.eventIDs)
 			p = nil
@@ -225,6 +250,10 @@ func (s *Sender) onAccepted(p *pending, resp response) {
 	if p.carriedFingerprint {
 		s.fpSent = true
 	}
+	if p.carriedMeta {
+		s.metaSent = true
+	}
+	s.skewWarned = false
 	if resp.configVersion > uint32(s.opt.Config().ConfigVersion) && s.opt.OnConfigVersion != nil {
 		s.opt.OnConfigVersion(resp.configVersion)
 	}
@@ -273,6 +302,9 @@ func (s *Sender) buildPending() *pending {
 	if !s.fpSent && len(s.opt.Fingerprint) > 0 {
 		p.carriedFingerprint = true
 	}
+	if !s.metaSent && len(reports) > 0 && len(s.opt.Meta) > 0 {
+		p.carriedMeta = true
+	}
 	return p
 }
 
@@ -292,6 +324,11 @@ func (s *Sender) attempt(ctx context.Context, p *pending) (response, error) {
 	}
 	if p.carriedFingerprint {
 		batch.Fingerprint = s.opt.Fingerprint
+	}
+	if p.carriedMeta && len(p.reports) > 0 {
+		// Decorate (idempotent under retries): the profile rides the first report
+		// of the batch, mark-after-202 in onAccepted.
+		p.reports[0].Meta = s.opt.Meta
 	}
 	body, err := s.enc.encode(batch)
 	if err != nil {
