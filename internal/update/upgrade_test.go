@@ -196,3 +196,239 @@ func TestWriteResultIsReadable(t *testing.T) {
 		t.Fatalf("result perms = %v, want 0644", info.Mode().Perm())
 	}
 }
+
+// --- End-to-end orchestration (real files, faked init system) ----------------
+
+// fakeCmd scripts responses for systemctl/runuser/dpkg/rpm/restorecon by the
+// first two argv tokens, and records the calls.
+type fakeCmd struct {
+	responses map[string]cmdReply // key: "name arg0 arg1" prefix match
+	lookable  map[string]bool
+	calls     []string
+	// showSeq lets `systemctl show SubState,NRestarts` return a sequence across
+	// successive health-poll iterations (index advances per call).
+	showSeq []string
+	showIdx int
+	// valueSeq lets `systemctl show -p NRestarts --value` return a sequence (the
+	// pre-upgrade baseline vs. the post-crash rollback re-baseline).
+	valueSeq []string
+	valueIdx int
+}
+
+type cmdReply struct {
+	out string
+	err error
+}
+
+func (f *fakeCmd) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	full := strings.TrimSpace(name + " " + strings.Join(args, " "))
+	f.calls = append(f.calls, full)
+
+	// Health poll (systemctl show -p SubState,NRestarts <svc>) returns a sequence.
+	if strings.HasPrefix(full, "systemctl show") && strings.Contains(full, "SubState") && len(f.showSeq) > 0 {
+		out := f.showSeq[min(f.showIdx, len(f.showSeq)-1)]
+		f.showIdx++
+		return []byte(out), nil
+	}
+	// NRestarts baseline (systemctl show -p NRestarts --value <svc>) — sequence.
+	if strings.HasPrefix(full, "systemctl show -p NRestarts --value") && len(f.valueSeq) > 0 {
+		out := f.valueSeq[min(f.valueIdx, len(f.valueSeq)-1)]
+		f.valueIdx++
+		return []byte(out), nil
+	}
+	for prefix, r := range f.responses {
+		if strings.HasPrefix(full, prefix) {
+			return []byte(r.out), r.err
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeCmd) LookPath(name string) bool { return f.lookable[name] }
+
+// stageBinary writes a fake "installed" binary and returns the engine + paths.
+func e2eEngine(t *testing.T, srv *httptest.Server, cmd *fakeCmd, current string) (*Engine, string) {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "livck-agent")
+	if err := os.WriteFile(bin, []byte("OLD-BINARY-"+current), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := New(Options{
+		BinaryPath:     bin,
+		ServiceName:    "livck-agent.service",
+		StateDir:       dir,
+		DownloadBase:   srv.URL,
+		Arch:           "amd64",
+		CurrentVersion: current,
+		HTTP:           srv.Client(),
+		Cmd:            cmd,
+		HealthWindow:   30 * time.Millisecond,
+		HealthPoll:     5 * time.Millisecond,
+		Now:            func() time.Time { return time.Unix(1_700_000_000, 0) },
+	})
+	return e, bin
+}
+
+// binaryServer serves /binary/<ver>/livck-agent_linux_amd64 (+ .sha256) with the
+// given payload, TLS.
+func binaryServer(t *testing.T, payload []byte) *httptest.Server {
+	t.Helper()
+	sum := sha256.Sum256(payload)
+	hexSum := hex.EncodeToString(sum[:])
+	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sha256") {
+			_, _ = w.Write([]byte(hexSum + "  livck-agent_linux_amd64\n"))
+			return
+		}
+		_, _ = w.Write(payload)
+	}))
+}
+
+func TestUpgradeEndToEndSelfManagedSwap(t *testing.T) {
+	newBytes := []byte("NEW-BINARY-v0.2.0")
+	srv := binaryServer(t, newBytes)
+	defer srv.Close()
+
+	cmd := &fakeCmd{
+		lookable: map[string]bool{"runuser": true}, // no dpkg/rpm → self-managed
+		responses: map[string]cmdReply{
+			"runuser":                            {out: "livck-agent v0.2.0"}, // smoke passes
+			"systemctl restart":                  {out: ""},
+			"systemctl show -p NRestarts --value": {out: "0"},
+		},
+		showSeq: []string{"SubState=running\nNRestarts=0"}, // healthy for the whole window
+	}
+	e, bin := e2eEngine(t, srv, cmd, "v0.1.0")
+
+	res, err := e.Run(context.Background(), Request{Target: "v0.2.0"})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if res.Outcome != "ok" {
+		t.Fatalf("outcome = %q, want ok (err=%q)", res.Outcome, res.Error)
+	}
+
+	// The live binary is now the NEW bytes, on the real path, executable.
+	got, _ := os.ReadFile(bin)
+	if string(got) != string(newBytes) {
+		t.Fatalf("live binary = %q, want the new bytes", got)
+	}
+	// The previous binary was preserved as .old (rollback slot).
+	old, err := os.ReadFile(bin + oldSuffix)
+	if err != nil || !strings.HasPrefix(string(old), "OLD-BINARY") {
+		t.Fatalf(".old backup missing/wrong: %v %q", err, old)
+	}
+	// A restart actually happened.
+	assertCalled(t, cmd, "systemctl restart")
+	// The result heartbeat was written.
+	if _, err := os.Stat(filepath.Join(e.opt.StateDir, ResultFile)); err != nil {
+		t.Fatal("update-result.json not written")
+	}
+}
+
+func TestUpgradeEndToEndRollsBackOnCrashLoop(t *testing.T) {
+	newBytes := []byte("NEW-BROKEN-v0.2.0")
+	srv := binaryServer(t, newBytes)
+	defer srv.Close()
+
+	cmd := &fakeCmd{
+		lookable: map[string]bool{"runuser": true},
+		responses: map[string]cmdReply{
+			"runuser":           {out: "livck-agent v0.2.0"}, // smoke passes (static ok)
+			"systemctl restart": {out: ""},
+		},
+		// Baseline reads: 0 before the upgrade, then 2 when the rollback re-baselines
+		// (the crash loop climbed the monotonic counter — the fix must re-capture it).
+		valueSeq: []string{"0", "2"},
+		// Upgrade health poll: crash (NRestarts 2 > baseline 0). Rollback health poll:
+		// the old binary is STABLE at 2 — healthy ONLY against the re-captured baseline
+		// of 2; against the stale pre-upgrade 0 it would falsely read as still crashing.
+		showSeq: []string{
+			"SubState=auto-restart\nNRestarts=2",
+			"SubState=running\nNRestarts=2",
+		},
+	}
+	e, bin := e2eEngine(t, srv, cmd, "v0.1.0")
+
+	res, err := e.Run(context.Background(), Request{Target: "v0.2.0"})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if res.Outcome != "rolled_back" {
+		t.Fatalf("outcome = %q, want rolled_back", res.Outcome)
+	}
+
+	// The live binary is the ORIGINAL again (rolled back from .old).
+	got, _ := os.ReadFile(bin)
+	if !strings.HasPrefix(string(got), "OLD-BINARY") {
+		t.Fatalf("live binary not rolled back: %q", got)
+	}
+	// Two restarts: the upgrade attempt + the rollback.
+	restarts := 0
+	for _, c := range cmd.calls {
+		if strings.HasPrefix(c, "systemctl restart") {
+			restarts++
+		}
+	}
+	if restarts < 2 {
+		t.Fatalf("want restart on upgrade AND rollback, got %d", restarts)
+	}
+}
+
+func TestUpgradeDigestMismatchNeverSwaps(t *testing.T) {
+	srv := binaryServer(t, []byte("legit"))
+	defer srv.Close()
+
+	cmd := &fakeCmd{lookable: map[string]bool{"runuser": true}}
+	e, bin := e2eEngine(t, srv, cmd, "v0.1.0")
+
+	// A wrong pinned digest must abort before any swap.
+	res, err := e.Run(context.Background(), Request{Target: "v0.2.0", Digest: strings.Repeat("0", 64)})
+	if err == nil {
+		t.Fatal("expected a hard error on digest mismatch")
+	}
+	if res.Outcome != "failed" {
+		t.Fatalf("outcome = %q, want failed", res.Outcome)
+	}
+	got, _ := os.ReadFile(bin)
+	if !strings.HasPrefix(string(got), "OLD-BINARY") {
+		t.Fatal("binary was swapped despite a digest mismatch")
+	}
+	for _, c := range cmd.calls {
+		if c == "systemctl restart" {
+			t.Fatal("restarted despite a digest mismatch")
+		}
+	}
+}
+
+func TestUpgradeSkipsWhenAlreadyCurrent(t *testing.T) {
+	srv := binaryServer(t, []byte("x"))
+	defer srv.Close()
+	cmd := &fakeCmd{
+		lookable: map[string]bool{},
+		responses: map[string]cmdReply{
+			// Daemon runs the current binary → nothing to do.
+			"systemctl show MainPID": {out: "0"},
+		},
+	}
+	e, _ := e2eEngine(t, srv, cmd, "v0.2.0")
+
+	res, err := e.Run(context.Background(), Request{Target: "v0.2.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != "skipped" {
+		t.Fatalf("outcome = %q, want skipped", res.Outcome)
+	}
+}
+
+func assertCalled(t *testing.T, cmd *fakeCmd, wantPrefix string) {
+	t.Helper()
+	for _, c := range cmd.calls {
+		if strings.HasPrefix(c, wantPrefix) {
+			return
+		}
+	}
+	t.Fatalf("expected a %q call; calls=%v", wantPrefix, cmd.calls)
+}

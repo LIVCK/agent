@@ -73,6 +73,26 @@ type Result struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// Commander runs external programs (systemctl, runuser, dpkg, …). Abstracted so
+// the swap/restart/health/rollback orchestration is testable end to end with real
+// files but a faked init system — the one part that otherwise only runs on a live
+// systemd host.
+type Commander interface {
+	Run(ctx context.Context, name string, args ...string) ([]byte, error)
+	LookPath(name string) bool
+}
+
+type execCommander struct{}
+
+func (execCommander) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
+func (execCommander) LookPath(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
 // Options wires the upgrade engine. Everything is injectable for tests; the CLI
 // fills the real values.
 type Options struct {
@@ -91,6 +111,12 @@ type Options struct {
 	HTTP           *http.Client
 	Log            *slog.Logger
 	Now            func() time.Time
+	// Cmd runs external programs; defaults to real exec. Tests inject a fake.
+	Cmd Commander
+	// HealthWindow / HealthPoll bound the post-restart crash-loop watch; zero uses
+	// the production defaults (20s / 2s). Tests shrink them.
+	HealthWindow time.Duration
+	HealthPoll   time.Duration
 }
 
 // Request is one upgrade invocation.
@@ -127,6 +153,15 @@ func New(opt Options) *Engine {
 	}
 	if opt.Now == nil {
 		opt.Now = time.Now
+	}
+	if opt.Cmd == nil {
+		opt.Cmd = execCommander{}
+	}
+	if opt.HealthWindow <= 0 {
+		opt.HealthWindow = healthWindow
+	}
+	if opt.HealthPoll <= 0 {
+		opt.HealthPoll = 2 * time.Second
 	}
 	return &Engine{opt: opt}
 }
@@ -272,13 +307,13 @@ func Lock(stateDir string) (func(), error) {
 // repo; a real apt/yum repo does not exist today, and if one ever ships, the
 // self-update must stand down per §10.8 "never two mechanisms"), else "self".
 func (e *Engine) ManagedBy(ctx context.Context) string {
-	if _, err := exec.LookPath("dpkg"); err == nil {
-		if out, err := runCmd(ctx, "dpkg", "-S", e.opt.BinaryPath); err == nil && strings.Contains(string(out), "livck-agent") {
+	if e.opt.Cmd.LookPath("dpkg") {
+		if out, err := e.opt.Cmd.Run(ctx, "dpkg", "-S", e.opt.BinaryPath); err == nil && strings.Contains(string(out), "livck-agent") {
 			return "package"
 		}
 	}
-	if _, err := exec.LookPath("rpm"); err == nil {
-		if out, err := runCmd(ctx, "rpm", "-qf", e.opt.BinaryPath); err == nil && strings.Contains(string(out), "livck-agent") {
+	if e.opt.Cmd.LookPath("rpm") {
+		if out, err := e.opt.Cmd.Run(ctx, "rpm", "-qf", e.opt.BinaryPath); err == nil && strings.Contains(string(out), "livck-agent") {
 			return "package"
 		}
 	}
@@ -350,11 +385,11 @@ func (e *Engine) Run(ctx context.Context, req Request) (Result, error) {
 	}
 
 	if err := e.restart(ctx); err != nil {
-		e.rollback(ctx, prevRestarts)
+		_ = e.rollback(ctx)
 		return e.finish(res, "rolled_back", err)
 	}
 	if err := e.healthy(ctx, prevRestarts); err != nil {
-		if rbErr := e.rollback(ctx, prevRestarts); rbErr != nil {
+		if rbErr := e.rollback(ctx); rbErr != nil {
 			return e.finish(res, "failed", fmt.Errorf("unhealthy after upgrade (%v) AND rollback failed: %w", err, rbErr))
 		}
 		return e.finish(res, "rolled_back", err)
@@ -470,7 +505,12 @@ func (e *Engine) applyBinary(ctx context.Context, req Request) error {
 // taken too, so the same restore applies (the package DB then reports the new
 // version while the binary is the old one — visible drift the operator resolves,
 // but the host keeps monitoring).
-func (e *Engine) rollback(ctx context.Context, prevRestarts int) error {
+//
+// The health baseline is RE-CAPTURED here, not inherited from before the upgrade:
+// NRestarts is a monotonic counter that systemctl restart does NOT reset, so the
+// failed upgrade's crash loop already pushed it above the pre-upgrade value. Reusing
+// that stale baseline would flag the (healthy) rolled-back service as still crashing.
+func (e *Engine) rollback(ctx context.Context) error {
 	oldPath := e.opt.BinaryPath + oldSuffix
 	if _, err := os.Stat(oldPath); err != nil {
 		return fmt.Errorf("no rollback binary: %w", err)
@@ -480,10 +520,11 @@ func (e *Engine) rollback(ctx context.Context, prevRestarts int) error {
 	}
 	fsyncDir(filepath.Dir(e.opt.BinaryPath))
 	e.restorecon(ctx)
+	baseline := e.nRestarts(ctx)
 	if err := e.restart(ctx); err != nil {
 		return err
 	}
-	return e.healthy(ctx, prevRestarts)
+	return e.healthy(ctx, baseline)
 }
 
 // recoverPrevious heals a crashed prior run: live binary missing but .old
@@ -522,9 +563,9 @@ func (e *Engine) writableCheck() error {
 
 func (e *Engine) applyPackage(ctx context.Context, req Request) error {
 	var format, installName string
-	if _, err := exec.LookPath("dpkg"); err == nil {
+	if e.opt.Cmd.LookPath("dpkg") {
 		format = "deb"
-	} else if _, err := exec.LookPath("rpm"); err == nil {
+	} else if e.opt.Cmd.LookPath("rpm") {
 		format = "rpm"
 	} else {
 		return errors.New("package-managed install but neither dpkg nor rpm found")
@@ -557,11 +598,11 @@ func (e *Engine) applyPackage(ctx context.Context, req Request) error {
 		if !dpkgLockFree() {
 			return errors.New("dpkg lock held (unattended-upgrades?) — retrying on the next run")
 		}
-		if out, err := runCmd(ctx, "dpkg", "-i", pkgPath); err != nil {
+		if out, err := e.opt.Cmd.Run(ctx, "dpkg", "-i", pkgPath); err != nil {
 			return fmt.Errorf("dpkg -i: %v: %s", err, firstLine(out))
 		}
 	} else {
-		if out, err := runCmd(ctx, "rpm", "-U", "--force", pkgPath); err != nil {
+		if out, err := e.opt.Cmd.Run(ctx, "rpm", "-U", "--force", pkgPath); err != nil {
 			return fmt.Errorf("rpm -U: %v: %s", err, firstLine(out))
 		}
 	}
@@ -775,15 +816,15 @@ func firstLine(b []byte) string {
 func (e *Engine) smoke(ctx context.Context, bin string) error {
 	ctx, cancel := context.WithTimeout(ctx, smokeTimeout)
 	defer cancel()
-	if _, err := exec.LookPath("runuser"); err == nil {
-		out, err := runCmd(ctx, "runuser", "-u", serviceUser, "--", bin, "version")
+	if e.opt.Cmd.LookPath("runuser") {
+		out, err := e.opt.Cmd.Run(ctx, "runuser", "-u", serviceUser, "--", bin, "version")
 		if err != nil {
 			return fmt.Errorf("%v: %s", err, firstLine(out))
 		}
 		return nil
 	}
 	// No runuser (unusual): still never run it as root — setuid via su.
-	out, err := runCmd(ctx, "su", "-s", bin, "-c", "version", serviceUser)
+	out, err := e.opt.Cmd.Run(ctx, "su", "-s", bin, "-c", "version", serviceUser)
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, firstLine(out))
 	}
@@ -791,7 +832,7 @@ func (e *Engine) smoke(ctx context.Context, bin string) error {
 }
 
 func (e *Engine) restart(ctx context.Context) error {
-	out, err := runCmd(ctx, "systemctl", "restart", e.opt.ServiceName)
+	out, err := e.opt.Cmd.Run(ctx, "systemctl", "restart", e.opt.ServiceName)
 	if err != nil {
 		return fmt.Errorf("systemctl restart: %v: %s", err, firstLine(out))
 	}
@@ -800,7 +841,7 @@ func (e *Engine) restart(ctx context.Context) error {
 
 // nRestarts reads the unit's automatic-restart counter (-1 when unknown).
 func (e *Engine) nRestarts(ctx context.Context) int {
-	out, err := runCmd(ctx, "systemctl", "show", "-p", "NRestarts", "--value", e.opt.ServiceName)
+	out, err := e.opt.Cmd.Run(ctx, "systemctl", "show", "-p", "NRestarts", "--value", e.opt.ServiceName)
 	if err != nil {
 		return -1
 	}
@@ -817,7 +858,9 @@ func (e *Engine) nRestarts(ctx context.Context) int {
 // NOT bumped by `systemctl restart` itself) or a non-running SubState is the
 // real signal.
 func (e *Engine) healthy(ctx context.Context, prevRestarts int) error {
-	deadline := e.opt.Now().Add(healthWindow)
+	// Real wall clock for the watch loop (opt.Now is for result timestamps, and may
+	// be a frozen test clock); the window/poll are configurable so tests run fast.
+	deadline := time.Now().Add(e.opt.HealthWindow)
 	for {
 		if remaining := time.Until(deadline); remaining <= 0 {
 			break
@@ -825,9 +868,9 @@ func (e *Engine) healthy(ctx context.Context, prevRestarts int) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(e.opt.HealthPoll):
 		}
-		out, err := runCmd(ctx, "systemctl", "show", "-p", "SubState,NRestarts", e.opt.ServiceName)
+		out, err := e.opt.Cmd.Run(ctx, "systemctl", "show", "-p", "SubState,NRestarts", e.opt.ServiceName)
 		if err != nil {
 			return fmt.Errorf("systemctl show: %v", err)
 		}
@@ -868,7 +911,7 @@ func parseShow(out string) (subState string, nRestarts int) {
 // installed binary matches the target but the RUNNING daemon still executes the
 // replaced (deleted) image.
 func (e *Engine) daemonRunsStaleBinary(ctx context.Context) bool {
-	out, err := runCmd(ctx, "systemctl", "show", "-p", "MainPID", "--value", e.opt.ServiceName)
+	out, err := e.opt.Cmd.Run(ctx, "systemctl", "show", "-p", "MainPID", "--value", e.opt.ServiceName)
 	if err != nil {
 		return false
 	}
@@ -886,13 +929,10 @@ func (e *Engine) daemonRunsStaleBinary(ctx context.Context) bool {
 // restorecon restores the SELinux context after a rename (RHEL9 & friends);
 // silently a no-op where SELinux/restorecon are absent.
 func (e *Engine) restorecon(ctx context.Context) {
-	if _, err := exec.LookPath("restorecon"); err != nil {
+	if !e.opt.Cmd.LookPath("restorecon") {
 		return
 	}
-	_, _ = runCmd(ctx, "restorecon", "-F", e.opt.BinaryPath)
+	_, _ = e.opt.Cmd.Run(ctx, "restorecon", "-F", e.opt.BinaryPath)
 }
 
-func runCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	return cmd.CombinedOutput()
-}
+
