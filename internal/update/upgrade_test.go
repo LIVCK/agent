@@ -432,3 +432,56 @@ func assertCalled(t *testing.T, cmd *fakeCmd, wantPrefix string) {
 	}
 	t.Fatalf("expected a %q call; calls=%v", wantPrefix, cmd.calls)
 }
+
+// TestUpgradePackagePathUsesVersionlessAssetName locks the package asset naming
+// to what the release workflow uploads + install.sh fetches (livck-agent_<arch>.deb,
+// versionless). A regression here 404s every package-managed upgrade in production.
+func TestUpgradePackagePathUsesVersionlessAssetName(t *testing.T) {
+	newDeb := []byte("FAKE-DEB-v0.2.5")
+	sum := sha256.Sum256(newDeb)
+	hexSum := hex.EncodeToString(sum[:])
+
+	var requested []string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, r.URL.Path)
+		_, _ = w.Write(newDeb)
+	}))
+	defer srv.Close()
+
+	cmd := &fakeCmd{
+		lookable: map[string]bool{"dpkg": true, "runuser": true},
+		responses: map[string]cmdReply{
+			"dpkg -S":           {out: "livck-agent: /usr/bin/livck-agent"}, // package-managed
+			"dpkg -i":           {out: ""},                                  // install ok
+			"systemctl restart": {out: ""},
+		},
+		showSeq:  []string{"SubState=running\nNRestarts=0"},
+		valueSeq: []string{"0"},
+	}
+	e, _ := e2eEngine(t, srv, cmd, "v0.2.4")
+
+	res, err := e.Run(context.Background(), Request{Target: "v0.2.5", Digest: hexSum})
+	if err != nil || res.Outcome != "ok" {
+		t.Fatalf("package upgrade: outcome=%q err=%v", res.Outcome, err)
+	}
+	if res.ManagedBy != "package" {
+		t.Fatalf("managed_by = %q, want package", res.ManagedBy)
+	}
+	// The download MUST target the versionless release asset name.
+	want := "/deb/v0.2.5/livck-agent_amd64.deb"
+	found := false
+	for _, p := range requested {
+		if p == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a request to %q; got %v", want, requested)
+	}
+}
+
+func TestRpmArchMapping(t *testing.T) {
+	if rpmArch("amd64") != "x86_64" || rpmArch("arm64") != "aarch64" {
+		t.Fatal("rpm arch mapping wrong")
+	}
+}

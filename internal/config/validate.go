@@ -60,7 +60,11 @@ func Summary(issues []Issue) string {
 }
 
 var (
-	semverRe  = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`)
+	// Optional leading "v": release tags are v-prefixed (GitHub, the artifact URL
+	// path, ParseSemver, the rollout admin field) so the config channel MUST accept
+	// "v0.2.1" too — otherwise a v-prefixed target_version is silently dropped and
+	// no update is ever advertised.
+	semverRe  = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`)
 	hhmmRe    = regexp.MustCompile(`^([01][0-9]|2[0-3]):[0-5][0-9]$`)
 	unitReStr = regexp.MustCompile(`^[A-Za-z0-9:_.@\\-]+\.[A-Za-z]+$`)
 )

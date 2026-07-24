@@ -561,6 +561,18 @@ func (e *Engine) writableCheck() error {
 // Package path (bare dpkg/rpm install)
 // ---------------------------------------------------------------------------
 
+// rpmArch maps the Go arch to the RPM arch label used in the release asset name.
+func rpmArch(goArch string) string {
+	switch goArch {
+	case "amd64":
+		return "x86_64"
+	case "arm64":
+		return "aarch64"
+	default:
+		return goArch
+	}
+}
+
 func (e *Engine) applyPackage(ctx context.Context, req Request) error {
 	var format, installName string
 	if e.opt.Cmd.LookPath("dpkg") {
@@ -570,7 +582,15 @@ func (e *Engine) applyPackage(ctx context.Context, req Request) error {
 	} else {
 		return errors.New("package-managed install but neither dpkg nor rpm found")
 	}
-	installName = fmt.Sprintf("livck-agent_%s_linux_%s.%s", strings.TrimPrefix(req.Target, "v"), e.opt.Arch, format)
+	// Asset name MUST match what the release workflow uploads and install.sh
+	// fetches: VERSIONLESS, deb keyed by the Go arch (amd64/arm64), rpm by the
+	// RPM arch (x86_64/aarch64). A versioned "..._linux_..." name (the earlier
+	// mistake) 404s against the real GitHub release assets.
+	if format == "deb" {
+		installName = fmt.Sprintf("livck-agent_%s.deb", e.opt.Arch)
+	} else {
+		installName = fmt.Sprintf("livck-agent_%s.rpm", rpmArch(e.opt.Arch))
+	}
 
 	dir := filepath.Join(e.opt.StateDir, "upgrade")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
