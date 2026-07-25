@@ -122,6 +122,8 @@ func main() {
 		}
 	case "enroll":
 		os.Exit(enrollCmd(os.Args[2:]))
+	case "status":
+		os.Exit(statusCmd(os.Args[2:]))
 	case "doctor":
 		os.Exit(doctorCmd(os.Args[2:]))
 	case "reset":
@@ -149,6 +151,7 @@ Commands:
                          --version X to pin, --force to downgrade; alias: update)
   reset                  wipe the local identity for a clean re-enroll (keeps the install)
   uninstall              stop, remove and purge the agent (--keep-data keeps state)
+  status                 runtime snapshot: phase, cloud reachability, config, usage
   doctor                 read-only self-diagnosis
   version                print the version
 
