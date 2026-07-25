@@ -2,8 +2,13 @@ package update
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +17,38 @@ import (
 	"testing"
 	"time"
 )
+
+// testKit is one ephemeral ECDSA-P256 key shared by the tests: the servers sign
+// artifacts with it (the way cosign does — ECDSA over SHA-256, ASN.1 DER, base64)
+// and the engine is given its public half. verify_test.go separately pins the
+// verifier to a REAL cosign fixture, so this ephemeral key is only a test vehicle.
+var testKit = mustSigKit()
+
+type sigKit struct {
+	priv   *ecdsa.PrivateKey
+	pubPEM string
+}
+
+func mustSigKit() *sigKit {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		panic(err)
+	}
+	return &sigKit{priv: priv, pubPEM: string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))}
+}
+
+func (k *sigKit) sign(content []byte) string {
+	sum := sha256.Sum256(content)
+	sig, err := ecdsa.SignASN1(rand.Reader, k.priv, sum[:])
+	if err != nil {
+		panic(err)
+	}
+	return base64.StdEncoding.EncodeToString(sig)
+}
 
 func TestParseSemverAcceptsAndRejects(t *testing.T) {
 	valid := []string{"v0.1.0", "0.1.0", "v1.2.3-rc1", "10.20.30"}
@@ -121,35 +158,43 @@ func TestRecoverPreviousRestoresBackup(t *testing.T) {
 	}
 }
 
-func TestDownloadEnforcesPinnedDigest(t *testing.T) {
+func TestDownloadVerifiesSignature(t *testing.T) {
 	payload := []byte("agent-binary-bytes")
-	sum := sha256.Sum256(payload)
-	hexSum := hex.EncodeToString(sum[:])
+	validSig := testKit.sign(payload)
+	wrongSig := testKit.sign([]byte("different content")) // valid DER, wrong artifact
 
+	sig := validSig
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sig))
+			return
+		}
 		_, _ = w.Write(payload)
 	}))
 	defer srv.Close()
 
 	dir := t.TempDir()
-	e := New(Options{BinaryPath: filepath.Join(dir, "bin"), StateDir: dir, HTTP: srv.Client()})
+	e := New(Options{BinaryPath: filepath.Join(dir, "bin"), StateDir: dir, HTTP: srv.Client(), PublicKeyPEM: testKit.pubPEM})
 
+	url := srv.URL + "/artifact" // real artifact URLs always carry a filename path
 	dst := filepath.Join(dir, "dl")
-	if _, err := e.download(context.Background(), srv.URL, dst, 0o644, hexSum); err != nil {
-		t.Fatalf("matching digest rejected: %v", err)
+	if _, err := e.download(context.Background(), url, dst, 0o644); err != nil {
+		t.Fatalf("a valid signature was rejected: %v", err)
 	}
-	if _, err := e.download(context.Background(), srv.URL, dst, 0o644, strings.Repeat("0", 64)); err == nil {
-		t.Fatal("wrong digest accepted")
+
+	sig = wrongSig
+	if _, err := e.download(context.Background(), url, dst, 0o644); err == nil {
+		t.Fatal("a signature over different bytes was accepted")
 	}
 	if _, err := os.Stat(dst); !os.IsNotExist(err) {
 		t.Fatal("failed download left the destination file behind")
 	}
 }
 
-func TestDownloadFailsClosedWithoutChecksum(t *testing.T) {
+func TestDownloadFailsClosedWithoutSignature(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, ".sha256") {
-			http.NotFound(w, r)
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			http.NotFound(w, r) // no signature published
 			return
 		}
 		_, _ = w.Write([]byte("bytes"))
@@ -157,10 +202,10 @@ func TestDownloadFailsClosedWithoutChecksum(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	e := New(Options{BinaryPath: filepath.Join(dir, "bin"), StateDir: dir, HTTP: srv.Client()})
+	e := New(Options{BinaryPath: filepath.Join(dir, "bin"), StateDir: dir, HTTP: srv.Client(), PublicKeyPEM: testKit.pubPEM})
 
-	if _, err := e.download(context.Background(), srv.URL+"/artifact", filepath.Join(dir, "dl"), 0o644, ""); err == nil {
-		t.Fatal("download without any integrity source must fail closed")
+	if _, err := e.download(context.Background(), srv.URL+"/artifact", filepath.Join(dir, "dl"), 0o644); err == nil {
+		t.Fatal("a download without a signature must fail closed")
 	}
 }
 
@@ -266,19 +311,19 @@ func e2eEngine(t *testing.T, srv *httptest.Server, cmd *fakeCmd, current string)
 		HealthWindow:   30 * time.Millisecond,
 		HealthPoll:     5 * time.Millisecond,
 		Now:            func() time.Time { return time.Unix(1_700_000_000, 0) },
+		PublicKeyPEM:   testKit.pubPEM,
 	})
 	return e, bin
 }
 
-// binaryServer serves /binary/<ver>/livck-agent_linux_amd64 (+ .sha256) with the
-// given payload, TLS.
+// binaryServer serves /binary/<ver>/livck-agent_linux_amd64 plus its cosign .sig
+// (signed with testKit) over TLS.
 func binaryServer(t *testing.T, payload []byte) *httptest.Server {
 	t.Helper()
-	sum := sha256.Sum256(payload)
-	hexSum := hex.EncodeToString(sum[:])
+	sig := testKit.sign(payload)
 	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, ".sha256") {
-			_, _ = w.Write([]byte(hexSum + "  livck-agent_linux_amd64\n"))
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sig))
 			return
 		}
 		_, _ = w.Write(payload)
@@ -376,28 +421,35 @@ func TestUpgradeEndToEndRollsBackOnCrashLoop(t *testing.T) {
 	}
 }
 
-func TestUpgradeDigestMismatchNeverSwaps(t *testing.T) {
-	srv := binaryServer(t, []byte("legit"))
+func TestUpgradeBadSignatureNeverSwaps(t *testing.T) {
+	// The server serves the artifact but a signature over DIFFERENT bytes — a
+	// compromised origin swapping the binary is exactly this shape.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(testKit.sign([]byte("a different artifact"))))
+			return
+		}
+		_, _ = w.Write([]byte("swapped-malicious-bytes"))
+	}))
 	defer srv.Close()
 
 	cmd := &fakeCmd{lookable: map[string]bool{"runuser": true}}
 	e, bin := e2eEngine(t, srv, cmd, "v0.1.0")
 
-	// A wrong pinned digest must abort before any swap.
-	res, err := e.Run(context.Background(), Request{Target: "v0.2.0", Digest: strings.Repeat("0", 64)})
+	res, err := e.Run(context.Background(), Request{Target: "v0.2.0"})
 	if err == nil {
-		t.Fatal("expected a hard error on digest mismatch")
+		t.Fatal("expected a hard error on a signature mismatch")
 	}
 	if res.Outcome != "failed" {
 		t.Fatalf("outcome = %q, want failed", res.Outcome)
 	}
 	got, _ := os.ReadFile(bin)
 	if !strings.HasPrefix(string(got), "OLD-BINARY") {
-		t.Fatal("binary was swapped despite a digest mismatch")
+		t.Fatal("binary was swapped despite a bad signature")
 	}
 	for _, c := range cmd.calls {
-		if c == "systemctl restart" {
-			t.Fatal("restarted despite a digest mismatch")
+		if strings.HasPrefix(c, "systemctl restart") {
+			t.Fatal("restarted despite a bad signature")
 		}
 	}
 }
@@ -438,12 +490,15 @@ func assertCalled(t *testing.T, cmd *fakeCmd, wantPrefix string) {
 // versionless). A regression here 404s every package-managed upgrade in production.
 func TestUpgradePackagePathUsesVersionlessAssetName(t *testing.T) {
 	newDeb := []byte("FAKE-DEB-v0.2.5")
-	sum := sha256.Sum256(newDeb)
-	hexSum := hex.EncodeToString(sum[:])
+	debSig := testKit.sign(newDeb)
 
 	var requested []string
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requested = append(requested, r.URL.Path)
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(debSig))
+			return
+		}
 		_, _ = w.Write(newDeb)
 	}))
 	defer srv.Close()
@@ -460,7 +515,7 @@ func TestUpgradePackagePathUsesVersionlessAssetName(t *testing.T) {
 	}
 	e, _ := e2eEngine(t, srv, cmd, "v0.2.4")
 
-	res, err := e.Run(context.Background(), Request{Target: "v0.2.5", Digest: hexSum})
+	res, err := e.Run(context.Background(), Request{Target: "v0.2.5"})
 	if err != nil || res.Outcome != "ok" {
 		t.Fatalf("package upgrade: outcome=%q err=%v", res.Outcome, err)
 	}

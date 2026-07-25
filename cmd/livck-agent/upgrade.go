@@ -85,13 +85,12 @@ func upgradeCmd(args []string) int {
 		}
 	}
 
-	// Resolve the target + its digest source.
+	// Resolve the target. Integrity is enforced by the cosign SIGNATURE the engine
+	// verifies against the compiled-in release key — not by a config-supplied digest.
 	target := strings.TrimSpace(*pinVersion)
-	digest := ""
 	source := "pinned"
 	if target == "" && cfg != nil && cfg.Update.TargetVersion != "" {
 		target = cfg.Update.TargetVersion
-		digest = cfg.Update.ArtifactSHA256[runtime.GOARCH]
 		source = "advertised"
 	}
 	if target == "" && !*auto {
@@ -132,7 +131,6 @@ func upgradeCmd(args []string) int {
 
 	res, err := engine.Run(ctx, update.Request{
 		Target: target,
-		Digest: digest,
 		Force:  *force,
 		Auto:   *auto,
 	})

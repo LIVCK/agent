@@ -8,9 +8,10 @@
 //     systemctl. Upgrades are a ROOT CLI concern, like enroll/reset/uninstall.
 //   - Pull-only: the target version comes from the agent config document
 //     (server-evaluated staged rollout). --auto NEVER uses "latest".
-//   - Fail closed: checksums are mandatory on every unattended path. The config
-//     may pin the artifact digest (update.artifact_sha256[arch]); the same-origin
-//     .sha256 file is the fallback for manual --version runs.
+//   - Fail closed on AUTHENTICITY: every downloaded artifact must carry a valid
+//     cosign signature (<artifact>.sig) verified against the compiled-in release
+//     public key. A compromised download origin can serve any bytes + any
+//     signature, but only artifacts signed by the OFFLINE private key install.
 //   - No window where /usr/bin/livck-agent does not exist: the old binary is
 //     hardlinked to .old, then the new one atomically renamed over the live path.
 //   - Health is judged by an NRestarts delta + SubState, NOT `is-active`
@@ -117,6 +118,9 @@ type Options struct {
 	// the production defaults (20s / 2s). Tests shrink them.
 	HealthWindow time.Duration
 	HealthPoll   time.Duration
+	// PublicKeyPEM is the release-signature trust anchor; empty uses the compiled-in
+	// ReleasePublicKeyPEM. Tests inject an ephemeral key.
+	PublicKeyPEM string
 }
 
 // Request is one upgrade invocation.
@@ -125,9 +129,6 @@ type Request struct {
 	// prefix). Resolved by the CLI: --version > config target_version > latest
 	// tag (manual only).
 	Target string
-	// Digest pins the artifact sha256 (hex) when the config supplied one for
-	// this arch. Empty = fall back to the same-origin .sha256 file (still hard).
-	Digest string
 	// Force allows a downgrade / same-version reinstall.
 	Force bool
 	// Auto marks a timer run (stricter no-op semantics; callers gate window and
@@ -162,6 +163,9 @@ func New(opt Options) *Engine {
 	}
 	if opt.HealthPoll <= 0 {
 		opt.HealthPoll = 2 * time.Second
+	}
+	if opt.PublicKeyPEM == "" {
+		opt.PublicKeyPEM = ReleasePublicKeyPEM
 	}
 	return &Engine{opt: opt}
 }
@@ -467,7 +471,7 @@ func (e *Engine) applyBinary(ctx context.Context, req Request) error {
 	newPath := e.opt.BinaryPath + newSuffix
 	url := fmt.Sprintf("%s/binary/%s/livck-agent_linux_%s", e.opt.DownloadBase, req.Target, e.opt.Arch)
 
-	sum, err := e.download(ctx, url, newPath, 0o755, req.Digest)
+	sum, err := e.download(ctx, url, newPath, 0o755)
 	if err != nil {
 		_ = os.Remove(newPath)
 		return err
@@ -600,7 +604,7 @@ func (e *Engine) applyPackage(ctx context.Context, req Request) error {
 	defer func() { _ = os.Remove(pkgPath) }()
 
 	url := fmt.Sprintf("%s/%s/%s/%s", e.opt.DownloadBase, format, req.Target, installName)
-	if _, err := e.download(ctx, url, pkgPath, 0o600, req.Digest); err != nil {
+	if _, err := e.download(ctx, url, pkgPath, 0o600); err != nil {
 		return err
 	}
 
@@ -647,21 +651,19 @@ func dpkgLockFree() bool {
 // Download + verification
 // ---------------------------------------------------------------------------
 
-// download fetches url into dst (perm), enforcing https-only redirects, the
-// size cap, and a MANDATORY sha256: pinnedDigest when the config supplied one,
-// else the same-origin .sha256 file — absence is a hard failure (fail closed;
-// unattended installs must never skip integrity). Returns the artifact hash.
-func (e *Engine) download(ctx context.Context, url, dst string, perm os.FileMode, pinnedDigest string) (string, error) {
-	expected := strings.ToLower(strings.TrimSpace(pinnedDigest))
-	if expected == "" {
-		sum, err := e.fetchChecksum(ctx, url+".sha256")
-		if err != nil {
-			return "", fmt.Errorf("no integrity source for %s: %w", filepath.Base(dst), err)
-		}
-		expected = sum
-	}
-	if !isHex64(expected) {
-		return "", errors.New("integrity digest is not a sha256 hex string")
+// download fetches url into dst (perm), enforcing https-only redirects + the size
+// cap, and verifies the artifact's cosign SIGNATURE (url + ".sig") against the
+// release public key. The signature is MANDATORY and fail-closed: a missing or
+// invalid signature aborts the install and leaves nothing on disk. This is the
+// supply-chain trust anchor — a compromised download origin can serve any bytes
+// AND any signature, but only an artifact signed by the OFFLINE private key
+// verifies against the compiled-in public key. Returns the artifact's sha256 hex
+// for the caller's on-disk recheck.
+func (e *Engine) download(ctx context.Context, url, dst string, perm os.FileMode) (string, error) {
+	// Signature sidecar first (small, mandatory) — no point streaming MBs if it is absent.
+	sig, err := e.fetchSignature(ctx, url+".sig")
+	if err != nil {
+		return "", fmt.Errorf("no signature for %s: %w", filepath.Base(dst), err)
 	}
 
 	body, err := e.get(ctx, url)
@@ -690,30 +692,29 @@ func (e *Engine) download(ctx context.Context, url, dst string, perm os.FileMode
 		return "", copyErr
 	}
 
-	got := hex.EncodeToString(h.Sum(nil))
-	if got != expected {
+	sum := h.Sum(nil)
+	if err := verifyDigestSignature(e.opt.PublicKeyPEM, sum, sig); err != nil {
 		_ = os.Remove(dst)
-		return "", fmt.Errorf("sha256 mismatch for %s", filepath.Base(dst))
+		return "", fmt.Errorf("signature verification failed for %s: %w", filepath.Base(dst), err)
 	}
-	return got, nil
+	return hex.EncodeToString(sum), nil
 }
 
-func (e *Engine) fetchChecksum(ctx context.Context, url string) (string, error) {
+// fetchSignature downloads the cosign .sig sidecar (a short base64 blob).
+func (e *Engine) fetchSignature(ctx context.Context, url string) ([]byte, error) {
 	body, err := e.get(ctx, url)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer func() { _ = body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(body, 4096))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	// "abc123...  filename" or bare hash.
-	first := strings.Fields(strings.TrimSpace(string(raw)))
-	if len(first) == 0 {
-		return "", errors.New("empty checksum file")
+	if strings.TrimSpace(string(raw)) == "" {
+		return nil, errors.New("empty signature file")
 	}
-	return strings.ToLower(first[0]), nil
+	return raw, nil
 }
 
 // get performs a GET with https-only redirect enforcement.
@@ -784,19 +785,6 @@ func (e *Engine) ResolveLatest(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("latest tag %q: %w", tag, err)
 	}
 	return tag, nil
-}
-
-func isHex64(s string) bool {
-	if len(s) != 64 {
-		return false
-	}
-	for _, r := range s {
-		ok := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')
-		if !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func fileSHA256(path string) (string, error) {
