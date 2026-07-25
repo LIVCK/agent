@@ -1,13 +1,22 @@
 name: release
 
 # Cut a GitHub release on a v* tag: cross-build the static agent binary
-# (amd64 + arm64), package deb + rpm via nfpm, and upload everything under
-# VERSIONLESS asset names. get.livck.cloud redirects /<fmt>/latest/<file> to
-# releases/latest/download/<file>, so GitHub's moving "latest" pointer (driven by
-# the versioned tag) plus versionless assets make both the `latest` install path
-# and a pinned `/<fmt>/vX.Y.Z/<file>` path resolve to the same files. install.sh
-# fetches exactly these names (livck-agent_amd64.deb, livck-agent_x86_64.rpm,
-# livck-agent_linux_amd64, …) and verifies the sibling .sha256.
+# (amd64 + arm64), package deb + rpm via nfpm, cosign-SIGN every artifact, and
+# upload everything under VERSIONLESS asset names. get.livck.cloud redirects
+# /<fmt>/latest/<file> to releases/latest/download/<file>, so GitHub's moving
+# "latest" pointer (driven by the versioned tag) plus versionless assets make both
+# the `latest` install path and a pinned `/<fmt>/vX.Y.Z/<file>` path resolve to the
+# same files. install.sh fetches exactly these names (livck-agent_amd64.deb,
+# livck-agent_x86_64.rpm, livck-agent_linux_amd64, …).
+#
+# Supply-chain trust anchor: each artifact ships a cosign SIGNATURE sidecar
+# (<file>.sig). The upgrade path (internal/update) verifies it against the release
+# PUBLIC key compiled into the binary — the private key lives OFFLINE (1Password,
+# mirrored to the COSIGN_PRIVATE_KEY/COSIGN_PASSWORD repo secrets), never in git. A
+# compromised origin can serve any bytes AND any signature, but only artifacts
+# signed by the offline key install. The legacy .sha256 sidecars stay for agents
+# <= v0.2.x (which verify same-origin checksums, not signatures) — harmless once
+# every host is on a signature-verifying build.
 on:
   push:
     tags: ['v*']
@@ -65,6 +74,39 @@ jobs:
           done
           echo "== release assets =="; ls -1
 
+      - name: Install cosign
+        if: github.ref_type == 'tag'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifacts (cosign, offline key)
+        if: github.ref_type == 'tag'
+        working-directory: dist
+        env:
+          # The signing key + its password live in 1Password (home of record) and are
+          # mirrored into these repo secrets so CI can sign. The key content is itself
+          # password-encrypted; cosign reads both from the env, so the raw PEM never
+          # touches disk in the runner.
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "${COSIGN_PRIVATE_KEY:-}" ]; then
+            echo "::error::COSIGN_PRIVATE_KEY secret is missing — refusing to publish an UNSIGNED release." >&2
+            exit 1
+          fi
+          # Sign every downloadable artifact. --tlog-upload=false keeps signing
+          # hermetic (key-based verification never consults Rekor); the sig is the
+          # base64 ASN.1/DER ECDSA that internal/update/verify.go checks.
+          for f in \
+            livck-agent_linux_amd64 livck-agent_linux_arm64 \
+            livck-agent_amd64.deb livck-agent_arm64.deb \
+            livck-agent_x86_64.rpm livck-agent_aarch64.rpm; do
+            cosign sign-blob --yes --tlog-upload=false \
+              --key env://COSIGN_PRIVATE_KEY "$f" > "$f.sig"
+            test -s "$f.sig" || { echo "::error::empty signature for $f" >&2; exit 1; }
+          done
+          echo "== signatures =="; ls -1 ./*.sig
+
       - name: Publish GitHub release
         if: github.ref_type == 'tag'
         env:
@@ -74,9 +116,9 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            dist/livck-agent_linux_amd64 dist/livck-agent_linux_amd64.sha256 \
-            dist/livck-agent_linux_arm64 dist/livck-agent_linux_arm64.sha256 \
-            dist/livck-agent_amd64.deb dist/livck-agent_amd64.deb.sha256 \
-            dist/livck-agent_arm64.deb dist/livck-agent_arm64.deb.sha256 \
-            dist/livck-agent_x86_64.rpm dist/livck-agent_x86_64.rpm.sha256 \
-            dist/livck-agent_aarch64.rpm dist/livck-agent_aarch64.rpm.sha256
+            dist/livck-agent_linux_amd64 dist/livck-agent_linux_amd64.sha256 dist/livck-agent_linux_amd64.sig \
+            dist/livck-agent_linux_arm64 dist/livck-agent_linux_arm64.sha256 dist/livck-agent_linux_arm64.sig \
+            dist/livck-agent_amd64.deb dist/livck-agent_amd64.deb.sha256 dist/livck-agent_amd64.deb.sig \
+            dist/livck-agent_arm64.deb dist/livck-agent_arm64.deb.sha256 dist/livck-agent_arm64.deb.sig \
+            dist/livck-agent_x86_64.rpm dist/livck-agent_x86_64.rpm.sha256 dist/livck-agent_x86_64.rpm.sig \
+            dist/livck-agent_aarch64.rpm dist/livck-agent_aarch64.rpm.sha256 dist/livck-agent_aarch64.rpm.sig
