@@ -75,3 +75,18 @@ jobs:
           else
             echo "no fuzz targets"
           fi
+
+  scripts:
+    name: Served scripts
+    runs-on: ubuntu-latest # ships dash (/bin/sh) + shellcheck preinstalled
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The get.livck.cloud-SERVED install.sh (placeholders replaced by the real
+      # systemd units) is what customers pipe into `sh` — syntax-check that form,
+      # not just the raw source. Guards the "unit-with-apostrophe broke the grep
+      # guard" class that a raw `sh -n` never sees.
+      - name: Check served install.sh (raw + assembled)
+        run: sh packaging/test/check-served-scripts.sh
