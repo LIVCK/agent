@@ -597,7 +597,7 @@ func (e *Engine) applyPackage(ctx context.Context, req Request) error {
 		return err
 	}
 	pkgPath := filepath.Join(dir, installName)
-	defer os.Remove(pkgPath)
+	defer func() { _ = os.Remove(pkgPath) }()
 
 	url := fmt.Sprintf("%s/%s/%s/%s", e.opt.DownloadBase, format, req.Target, installName)
 	if _, err := e.download(ctx, url, pkgPath, 0o600, req.Digest); err != nil {
@@ -635,7 +635,7 @@ func dpkgLockFree() bool {
 	if err != nil {
 		return true // no lock file → not Debian-managed enough to block us
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return false
 	}
@@ -668,7 +668,7 @@ func (e *Engine) download(ctx context.Context, url, dst string, perm os.FileMode
 	if err != nil {
 		return "", err
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 	if err != nil {
@@ -703,7 +703,7 @@ func (e *Engine) fetchChecksum(ctx context.Context, url string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(body, 4096))
 	if err != nil {
 		return "", err
@@ -763,7 +763,7 @@ func (e *Engine) ResolveLatest(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 
 	loc := resp.Header.Get("Location")
@@ -804,7 +804,7 @@ func fileSHA256(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -954,5 +954,3 @@ func (e *Engine) restorecon(ctx context.Context) {
 	}
 	_, _ = e.opt.Cmd.Run(ctx, "restorecon", "-F", e.opt.BinaryPath)
 }
-
-

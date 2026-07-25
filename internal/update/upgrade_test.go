@@ -293,8 +293,8 @@ func TestUpgradeEndToEndSelfManagedSwap(t *testing.T) {
 	cmd := &fakeCmd{
 		lookable: map[string]bool{"runuser": true}, // no dpkg/rpm → self-managed
 		responses: map[string]cmdReply{
-			"runuser":                            {out: "livck-agent v0.2.0"}, // smoke passes
-			"systemctl restart":                  {out: ""},
+			"runuser":                             {out: "livck-agent v0.2.0"}, // smoke passes
+			"systemctl restart":                   {out: ""},
 			"systemctl show -p NRestarts --value": {out: "0"},
 		},
 		showSeq: []string{"SubState=running\nNRestarts=0"}, // healthy for the whole window
