@@ -22,6 +22,12 @@ const (
 	// maxServerMsg caps inbound frames. pulse only sends control frames on this
 	// channel, so anything larger is anomalous.
 	maxServerMsg = 4 * 1024
+	// controlQueue buffers inbound control frames between the read pump and the
+	// streamer's loop. The pump must never block on the streamer (it also drives
+	// ping/pong and closure detection), so a full queue drops the newest frame
+	// instead of waiting: pulse repeats stream_on every 15 s, so a dropped frame
+	// costs at most one keepalive round, never correctness.
+	controlQueue = 8
 )
 
 // errConnClosed is returned by WriteText once the read pump has observed the
@@ -47,18 +53,19 @@ func (g *gorillaDialer) Dial(ctx context.Context, url, token string) (Conn, erro
 	if err != nil {
 		return nil, err
 	}
-	gc := &gorillaConn{c: c, done: make(chan struct{})}
+	gc := &gorillaConn{c: c, msgs: make(chan []byte, controlQueue), done: make(chan struct{})}
 	gc.start()
 	return gc, nil
 }
 
 // gorillaConn wraps a *websocket.Conn. A background read pump drives ping/pong
-// (so pulse's keepalive is answered and the read deadline is refreshed) and
-// detects closure. Writes happen only on the streamer's single goroutine, and
-// the ping handler's WriteControl is concurrency-safe with WriteMessage, so no
-// write mutex is needed.
+// (so pulse's keepalive is answered and the read deadline is refreshed), hands
+// inbound control frames to the streamer and detects closure. Writes happen only
+// on the streamer's single goroutine, and the ping handler's WriteControl is
+// concurrency-safe with WriteMessage, so no write mutex is needed.
 type gorillaConn struct {
 	c    *websocket.Conn
+	msgs chan []byte
 	done chan struct{}
 	once sync.Once
 }
@@ -77,18 +84,39 @@ func (gc *gorillaConn) start() {
 	go gc.readPump()
 }
 
-// readPump drains inbound frames until the peer closes or errors. It exists to
-// service ping/pong and to observe closure; the payloads pulse sends are not
-// used by the agent.
+// readPump drains inbound frames until the peer closes or errors. It services
+// ping/pong, forwards TEXT payloads (pulse's control frames) to the streamer and
+// closes msgs on the way out.
+//
+// It is the ONLY goroutine that sends on msgs and the only one that closes it,
+// so the non-blocking send can never race the close — Close() from the streamer
+// side merely kills the socket, which makes ReadMessage fail and lets this
+// goroutine do the closing.
 func (gc *gorillaConn) readPump() {
-	defer gc.markClosed()
+	defer func() {
+		close(gc.msgs)
+		gc.markClosed()
+	}()
 	for {
-		if _, _, err := gc.c.ReadMessage(); err != nil {
+		mt, b, err := gc.c.ReadMessage()
+		if err != nil {
 			return
 		}
 		_ = gc.c.SetReadDeadline(time.Now().Add(pongWait))
+		if mt != websocket.TextMessage {
+			continue
+		}
+		select {
+		case gc.msgs <- b:
+		default: // Streamer busy: drop, see controlQueue.
+		}
 	}
 }
+
+// Recv exposes the inbound control frames. The channel is closed when the
+// connection dies, which is how a session that is currently NOT bursting learns
+// the peer is gone: it never writes, so it would never see errConnClosed.
+func (gc *gorillaConn) Recv() <-chan []byte { return gc.msgs }
 
 // WriteText sends one burst frame. It returns errConnClosed once the read pump
 // has seen the connection die.
