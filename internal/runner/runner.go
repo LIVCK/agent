@@ -66,6 +66,17 @@ type Options struct {
 	// Zero uses a default. Cheap collectors read /proc and finish in well under a
 	// millisecond, so this stays short.
 	CollectTimeout time.Duration
+	// ProfileRefresh re-reads the host fact profile and hands it to the sender,
+	// which forwards it only when it actually changed (Sender.SetMeta). Nil disables
+	// the refresh, which is what every test that does not exercise it wants.
+	//
+	// It runs from the collect loop rather than on its own goroutine because it is a
+	// host read like any other collector, and because the loop already owns the clock
+	// the tests drive.
+	ProfileRefresh func()
+	// ProfileInterval is the minimum wall-clock distance between two ProfileRefresh
+	// calls. Zero uses DefaultProfileInterval.
+	ProfileInterval time.Duration
 	// IntervalCollectTimeout bounds ONE interval-sampled (exec-based) collector's
 	// collect call — probe, smart, gpu. It is far larger than CollectTimeout
 	// because probe fans out to probeMaxTargets (each TCP target can take
@@ -78,10 +89,26 @@ type Options struct {
 	IntervalCollectTimeout time.Duration
 }
 
+// DefaultProfileInterval is how often the host fact profile is re-read.
+//
+// The facts it covers (distro, kernel, arch, cpu, ram, pending-reboot flag) change on
+// a package upgrade, a hotplug or an administrator's decision - never on a timescale
+// where seconds matter. Re-reading it per report would mean sweeping /proc/cpuinfo and
+// /proc/stat every 30s forever to catch a change that happens monthly, so this rides
+// the slowest existing cadence in the agent instead: the config poll
+// (config.DefaultPollInterval). That bounds a stale system tag at five minutes, which
+// no human notices, at a fraction of the reads.
+const DefaultProfileInterval = 5 * time.Minute
+
 // Runner owns the collect loop and shutdown spool.
 type Runner struct {
 	opt Options
 	log *slog.Logger
+
+	// lastProfileAt is when the host profile was last read. It is seeded at loop
+	// start, because the profile the sender was built with was read moments earlier
+	// during startup - re-reading it immediately would buy nothing.
+	lastProfileAt time.Time
 
 	// lastUpdateResult is the raw result-file content already reported, so the
 	// heartbeat rides exactly one report per upgrade run (plus one on process
@@ -148,6 +175,8 @@ func (r *Runner) Run(ctx context.Context) error {
 // Each iteration sub-samples the cheap collectors across the interval and
 // collapses the accumulated values into a single report.
 func (r *Runner) collectLoop(ctx context.Context) {
+	r.lastProfileAt = r.opt.Platform.Clock.Now()
+
 	for {
 		rep := r.collectInterval(ctx)
 		if rep == nil {
@@ -157,7 +186,28 @@ func (r *Runner) collectLoop(ctx context.Context) {
 		if r.opt.Lifecycle != nil {
 			r.opt.Lifecycle.Tick(ctx)
 		}
+		r.refreshProfile()
 	}
+}
+
+// refreshProfile re-reads the host fact profile at most once per ProfileInterval.
+// The report interval is configurable down to 30s, so the check has to be against
+// elapsed wall clock rather than a loop counter, or a 30s host would refresh ten
+// times as often as a 300s one.
+func (r *Runner) refreshProfile() {
+	if r.opt.ProfileRefresh == nil {
+		return
+	}
+	interval := r.opt.ProfileInterval
+	if interval <= 0 {
+		interval = DefaultProfileInterval
+	}
+	now := r.opt.Platform.Clock.Now()
+	if now.Sub(r.lastProfileAt) < interval {
+		return
+	}
+	r.lastProfileAt = now
+	r.opt.ProfileRefresh()
 }
 
 // collectInterval runs one report interval: it reads the interval-sampled

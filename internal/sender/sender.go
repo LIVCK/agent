@@ -11,11 +11,15 @@ package sender
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/LIVCK/agent/internal/buffer"
@@ -57,11 +61,14 @@ type Options struct {
 	// Fingerprint is attached to batches until the first 202 (and re-attached
 	// when it changes). May be nil.
 	Fingerprint map[string]string
-	// Meta is the host profile (hostinfo.Meta). It decorates the first report of
-	// every batch until a batch that carried it gets a 202 — delivery-confirmed,
+	// Meta is the INITIAL host profile (hostinfo.Meta). It decorates the first report
+	// of every batch until a batch that carried it gets a 202 - delivery-confirmed,
 	// unlike the old assemble-time flag, which lost the profile for the whole
 	// process lifetime when the bootstrap report was evicted from the ring
 	// during a long initial ingest outage. May be nil.
+	//
+	// After construction the profile is owned by the Sender: hand a re-read profile
+	// to SetMeta, which re-arms delivery only when it actually differs.
 	Meta map[string]string
 	// OnConfigVersion is called when a 202 advertises a newer config version.
 	OnConfigVersion func(v uint32)
@@ -71,6 +78,67 @@ type Options struct {
 	CapBackoff      time.Duration
 	QuarantineFloor time.Duration
 	Jitter          jitterFn
+}
+
+// metaKeyRAMTotal is the profile key whose raw value is deliberately NOT compared
+// verbatim; see MetaDigest.
+const metaKeyRAMTotal = "ram_total_bytes"
+
+// volatileMetaKeys are dropped from the change digest because they move without the
+// host having changed, and re-sending the whole profile for them would defeat the
+// point of sending on change at all.
+//
+// boot_time is read from /proc/stat btime, which the kernel derives from the current
+// wall clock minus uptime. An NTP step or slew shifts it by a second or two on a host
+// that has been idle for months. A genuine change to boot_time means the machine
+// rebooted, and a reboot restarts the agent, which sends the profile from the
+// first-report-after-start path regardless.
+var volatileMetaKeys = map[string]bool{"boot_time": true}
+
+// MetaDigest fingerprints a host profile for change detection: sorted key=value pairs
+// hashed, volatile keys dropped, ram_total_bytes compared in whole GiB.
+//
+// The GiB rounding is not cosmetic. MemTotal is derived from totalram_pages, and a
+// balloon driver (virtio_balloon on KVM/Proxmox, hv_balloon on Hyper-V) hands pages
+// back and forth at runtime, so a ballooned guest reports a MemTotal that drifts by
+// tens of MiB all day long. Nobody resizes a VM by less than a gigabyte, so whole GiB
+// keeps every real change and drops the entire balloon noise floor.
+//
+// Exported so the wiring that feeds SetMeta can be tested against the same key the
+// sender compares on.
+func MetaDigest(meta map[string]string) string {
+	keys := make([]string, 0, len(meta))
+	for k := range meta {
+		if !volatileMetaKeys[k] {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	h := sha256.New()
+	for _, k := range keys {
+		v := meta[k]
+		if k == metaKeyRAMTotal {
+			v = ramGiB(v)
+		}
+		// The NUL separators keep {"ab":"c"} and {"a":"bc"} from colliding.
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write([]byte(v))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ramGiB rounds a byte count to the nearest whole GiB. A value that is not a plain
+// integer is passed through untouched so an unexpected format still compares exactly.
+func ramGiB(v string) string {
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return v
+	}
+	const halfGiB = 1 << 29
+	return strconv.FormatUint((n+halfGiB)>>30, 10)
 }
 
 // Sender drives delivery.
@@ -86,11 +154,18 @@ type Sender struct {
 	quarantineFloor time.Duration
 	jitter          jitterFn
 
-	fpSent   bool
-	metaSent bool
+	fpSent bool
 	// skewWarned dedupes the 422 clock-skew alarm to one event per skew episode
 	// (reset by the next accepted batch).
 	skewWarned bool
+
+	// mu guards the host profile, which is the one piece of sender state a second
+	// goroutine writes: the collect loop calls SetMeta after re-reading the host
+	// facts, while the delivery loop reads it when it builds and confirms a batch.
+	mu         sync.Mutex
+	meta       map[string]string
+	metaDigest string
+	metaSent   bool
 }
 
 // New builds a Sender.
@@ -131,7 +206,33 @@ func New(opt Options) (*Sender, error) {
 		capBackoff:      capDur,
 		quarantineFloor: qfloor,
 		jitter:          jit,
+		meta:            opt.Meta,
+		metaDigest:      MetaDigest(opt.Meta),
 	}, nil
+}
+
+// SetMeta installs a freshly collected host profile.
+//
+// The wire contract sends meta "only on change plus the first report after start"
+// (SERVER-AGENT.md 4.1), so this is the "on change" half. An unchanged profile is a
+// complete no-op: neither the stored map nor the delivery flag move, and the next
+// batch stays profile-free. A changed profile re-arms the attach flag, so the next
+// batch carries it and mark-after-202 confirms it exactly like the bootstrap profile.
+//
+// A restart needs no special case: a fresh Sender starts with metaSent false, so the
+// first report of every process life carries the profile whether it changed or not.
+func (s *Sender) SetMeta(meta map[string]string) {
+	digest := MetaDigest(meta)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if digest == s.metaDigest {
+		return
+	}
+	s.meta = meta
+	s.metaDigest = digest
+	s.metaSent = false
 }
 
 // Wake nudges the delivery loop to drain now (called after the collect loop
@@ -155,6 +256,11 @@ type pending struct {
 	eventIDs           []string
 	carriedFingerprint bool
 	carriedMeta        bool
+	// meta and metaDigest are the profile snapshot this batch carries. They are
+	// captured at build time so every retry re-encodes the same bytes, and so a
+	// refresh that lands mid-flight is not mistaken for delivered by the 202.
+	meta       map[string]string
+	metaDigest string
 }
 
 // Run drives delivery until ctx is done. It holds a batch across retries so the
@@ -251,7 +357,14 @@ func (s *Sender) onAccepted(p *pending, resp response) {
 		s.fpSent = true
 	}
 	if p.carriedMeta {
-		s.metaSent = true
+		// Only mark delivered when the profile that just landed is still the current
+		// one. A SetMeta between build and 202 leaves the digests apart, so the newer
+		// profile rides the next batch instead of being swallowed by this one's ack.
+		s.mu.Lock()
+		if p.metaDigest == s.metaDigest {
+			s.metaSent = true
+		}
+		s.mu.Unlock()
 	}
 	s.skewWarned = false
 	if resp.configVersion > uint32(s.opt.Config().ConfigVersion) && s.opt.OnConfigVersion != nil {
@@ -302,9 +415,15 @@ func (s *Sender) buildPending() *pending {
 	if !s.fpSent && len(s.opt.Fingerprint) > 0 {
 		p.carriedFingerprint = true
 	}
-	if !s.metaSent && len(reports) > 0 && len(s.opt.Meta) > 0 {
+
+	s.mu.Lock()
+	if !s.metaSent && len(reports) > 0 && len(s.meta) > 0 {
 		p.carriedMeta = true
+		p.meta = s.meta
+		p.metaDigest = s.metaDigest
 	}
+	s.mu.Unlock()
+
 	return p
 }
 
@@ -328,10 +447,12 @@ func (s *Sender) attempt(ctx context.Context, p *pending) (response, error) {
 	if p.carriedMeta && len(p.reports) > 0 {
 		// Decorate (idempotent under retries): the profile rides the first report
 		// of the batch, mark-after-202 in onAccepted. MERGED under any meta the
-		// report already carries (the runner's updater heartbeat) — report-level
-		// keys win, and s.opt.Meta itself is never mutated.
-		merged := make(map[string]string, len(s.opt.Meta)+len(p.reports[0].Meta))
-		for k, v := range s.opt.Meta {
+		// report already carries (the runner's updater heartbeat) - report-level
+		// keys win, and the stored profile map itself is never mutated. p.meta is
+		// the snapshot taken at build time, so a refresh landing mid-retry cannot
+		// change the bytes behind a live idempotency key.
+		merged := make(map[string]string, len(p.meta)+len(p.reports[0].Meta))
+		for k, v := range p.meta {
 			merged[k] = v
 		}
 		for k, v := range p.reports[0].Meta {
