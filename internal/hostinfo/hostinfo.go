@@ -1,8 +1,13 @@
 // Package hostinfo builds the two host-fact maps the agent attaches to batches:
-// the report/enroll meta profile (os, distro, kernel, arch, cpu, ram, boot time)
-// and the fingerprint used for clone detection (a hashed machine-id, the boot_id
-// and the hostname). It reads only unprivileged /proc and /etc files through the
-// platform abstraction so both maps are built from fakes in tests.
+// the report/enroll meta profile (os, distro, kernel, arch, cpu, ram, boot time,
+// virtualization) and the fingerprint used for clone detection (a hashed
+// machine-id, the boot_id and the hostname). Everything but the virtualization
+// probe reads only unprivileged /proc, /etc and /sys files through the platform
+// abstraction, so both maps are built from fakes in tests.
+//
+// The profile is split by cost: Meta holds the cheap file reads the runner
+// re-runs every five minutes, Virtualization is the one fact that needs a fork,
+// and Profiler composes them so that fork happens exactly once per process.
 //
 // Two hard rules from the contract: the machine-id is never sent raw, only its
 // sha256 (privacy); and ips_* never appear in report meta (they are enroll-only),
@@ -33,8 +38,13 @@ const (
 	rebootVarPath = "/var/run/reboot-required"
 )
 
-// Meta builds the report/enroll host profile. Missing facts are omitted rather
-// than faked; os and arch are always known. It never includes ips_*.
+// Meta builds the cheap half of the host profile: the facts that are a handful
+// of /proc and /etc reads and can therefore be re-read on every refresh. Missing
+// facts are omitted rather than faked; os and arch are always known. It never
+// includes ips_*.
+//
+// Callers want Profiler.Profile() instead - it adds the facts that cost a fork
+// (virtualization, the device display names) without paying for them twice.
 func Meta(plat platform.Platform) map[string]string {
 	m := map[string]string{
 		"os":   "linux",

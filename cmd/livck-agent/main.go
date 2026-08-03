@@ -199,9 +199,12 @@ func enrollCmd(args []string) int {
 		Name:         *name,
 		Tags:         splitTags(*tags),
 		AgentVersion: version,
-		Meta:         hostinfo.Meta(plat),
-		Fingerprint:  hostinfo.Fingerprint(plat),
-		PrivateIPs:   enroll.LocalPrivateIPs(),
+		// Same profile shape as the report path (Meta plus the once-resolved
+		// virtualization), so the system tags the enroll creates match the ones the
+		// first report would have produced.
+		Meta:        hostinfo.NewProfiler(ctx, plat).Profile(),
+		Fingerprint: hostinfo.Fingerprint(plat),
+		PrivateIPs:  enroll.LocalPrivateIPs(),
 	})
 	if err != nil {
 		return reportEnrollError(err)
@@ -366,20 +369,19 @@ func run() error {
 
 	trigger := make(chan struct{}, 1)
 
+	// The signal context is established before the host profile because the
+	// profile's one-shot virtualization probe forks a binary: a Ctrl-C during
+	// startup has to be able to cut that short.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// Host-profile meta for the sender (decorates the first report of each batch
-	// until a 202 confirms it). The GPU/SMART display names are resolved below
-	// (they need the run ctx for their one-shot forks) and are kept in their own
-	// map so a later re-read of the cheap procfs facts can overlay them again
-	// without re-forking nvidia-smi or smartctl.
-	deviceNames := map[string]string{}
-	hostProfile := func() map[string]string {
-		m := hostinfo.Meta(plat)
-		for k, v := range deviceNames {
-			m[k] = v
-		}
-		return m
-	}
-	hostMeta := hostProfile()
+	// until a 202 confirms it). The profiler re-reads the cheap procfs facts on
+	// every call and overlays the facts that cost a fork - virtualization, plus
+	// the GPU/SMART display names added below - so the five-minute refresh never
+	// forks systemd-detect-virt, nvidia-smi or smartctl a second time.
+	profiler := hostinfo.NewProfiler(ctx, plat)
+	hostMeta := profiler.Profile()
 
 	sndr, err := sender.New(sender.Options{
 		Client:       client,
@@ -408,9 +410,6 @@ func run() error {
 	}
 	defer sndr.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	// Live-Watch signal channel: a SECOND registry so its rate collectors
 	// keep delta state independent of the report loop. The streamer arms
 	// itself on features.live and idles otherwise, so it costs nothing when nobody
@@ -431,7 +430,7 @@ func run() error {
 	// bootstrap meta → service_agents.meta → the detail "Devices" panel, so a card reads
 	// "NVIDIA GeForce RTX 4080" instead of a bare PCI address. Best-effort: absent on non-NVIDIA hosts.
 	for pci, name := range gpu.QueryNames(ctx, plat.Exec) {
-		deviceNames["gpu."+pci+".name"] = name
+		profiler.Set("gpu."+pci+".name", name)
 	}
 	// AMD cards have no nvidia-smi equivalent, so their model is resolved from the
 	// host pci.ids database via each card's sysfs PCI vendor:device. Same meta key
@@ -439,22 +438,19 @@ func run() error {
 	// Best-effort: absent on hosts without pci.ids (covered by the console's
 	// ordinal fallback).
 	for pci, name := range gpu.QueryAMDNames(plat.FS) {
-		deviceNames["gpu."+pci+".name"] = name
+		profiler.Set("gpu."+pci+".name", name)
 	}
 	// Same idea for SMART drives: the model name (nvme0 → "Samsung SSD 9100 PRO 2TB") rides the meta
 	// (needs root, like the SMART metrics themselves). Only runs when features.smart is on.
 	if cfg.Current().Features.Smart {
 		for dev, name := range smart.QueryNames(ctx, plat.Exec) {
-			deviceNames["smart."+dev+".name"] = name
+			profiler.Set("smart."+dev+".name", name)
 		}
 	}
-	// Hand the profile including the device names to the sender. The loop has not
-	// started yet, so this is also what removes the old write-after-handoff on the
-	// map the sender already held.
-	for k, v := range deviceNames {
-		hostMeta[k] = v
-	}
-	sndr.SetMeta(hostMeta)
+	// Hand the profile including the device names to the sender. Profile() builds
+	// a fresh map, so the sender never shares a map the startup path still writes
+	// to. A no-name host produces the identical profile and SetMeta no-ops.
+	sndr.SetMeta(profiler.Profile())
 
 	r := runner.New(runner.Options{
 		Platform:      plat,
@@ -474,7 +470,7 @@ func run() error {
 		// start"). Without it a distro upgrade, a kernel swap or a CPU/RAM resize kept
 		// the server's system tags on the values read at process start, and the console
 		// showed the old distro until something happened to restart the agent.
-		ProfileRefresh: func() { sndr.SetMeta(hostProfile()) },
+		ProfileRefresh: func() { sndr.SetMeta(profiler.Profile()) },
 	})
 
 	log.Info("livck-agent starting", "version", version, "instance_id", instanceID, "state_dir", stateDir,
