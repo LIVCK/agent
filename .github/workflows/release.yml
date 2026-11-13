@@ -44,8 +44,10 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
+      # The version is pinned in the Makefile: a floating @latest would let
+      # whatever nfpm publishes next assemble the packages we sign below.
       - name: Install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+        run: make tools
 
       - name: Resolve version
         id: v
@@ -57,6 +59,12 @@ jobs:
           else
             echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
+
+      # Last gate before anything is built or signed. setup-go has just taken
+      # the newest patch of the release line, so a finding here means a
+      # dependency needs a bump, or Go has no fix out yet.
+      - name: Scan for known vulnerabilities
+        run: make vuln
 
       - name: Build binaries + deb/rpm
         run: make package VERSION=${{ steps.v.outputs.version }}
