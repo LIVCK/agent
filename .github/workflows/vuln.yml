@@ -1,0 +1,73 @@
+name: vuln
+
+# Daily look for known vulnerabilities. An advisory can land without any change
+# in this repo, so the check in CI alone would stay green on a quiet branch.
+#
+#   source     main at its current commit, built with the newest patch of the
+#              Go release line. Fails when a dependency needs a bump.
+#   published  the binaries behind get.livck.cloud, which is what an install
+#              or an update pulls right now. Fails when a new release is due.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vuln
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: Source (main)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: govulncheck
+        run: make vuln
+
+  published:
+    name: Published binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Only for the Makefile, which carries the pinned scanner version.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Download the latest release binaries
+        run: |
+          set -eu
+          mkdir -p published
+          for arch in amd64 arm64; do
+            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 \
+              -o "published/livck-agent_linux_${arch}" \
+              "https://get.livck.cloud/binary/latest/livck-agent_linux_${arch}"
+          done
+          ls -l published
+
+      # Binary mode has no call graph: it reports every vulnerable symbol that
+      # is linked in, which is stricter than the source scan.
+      - name: govulncheck (binary mode)
+        run: make vuln-binary BIN="published/livck-agent_linux_amd64 published/livck-agent_linux_arm64"
