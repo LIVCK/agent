@@ -34,9 +34,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # Same source as CI: the release line from .go-version, newest patch.
           go-version-file: .go-version
@@ -76,9 +76,15 @@ jobs:
           done
           echo "== release assets =="; ls -1
 
+      # Stay on cosign v2. From v3 on, sign-blob needs --bundle and writes a
+      # different sidecar, while internal/update/verify.go checks the plain
+      # base64 signature. Moving to v3 is a change to the update path, not a
+      # tool bump.
       - name: Install cosign
         if: github.ref_type == 'tag'
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: 'v2.6.1'
 
       - name: Sign artifacts (cosign, offline key)
         if: github.ref_type == 'tag'
