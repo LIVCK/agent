@@ -1,4 +1,4 @@
-.PHONY: help build loadgen dist package test test-race e2e soak vet lint fmt tidy clean wire
+.PHONY: help build loadgen dist package tools test test-race e2e soak vet lint vuln vuln-binary fmt tidy clean wire
 
 # livck-agent build. The binary is pure-static (CGO disabled) and stripped, as
 # the hardened systemd unit expects.
@@ -16,6 +16,11 @@ GOFLAGS     := -trimpath
 DIST_DIR  := dist
 ARCHES    := amd64 arm64
 PACKAGERS := deb rpm
+
+# Build-time tools, pinned. Neither is an agent dependency and nothing of them
+# is linked into the binary; CI and the release job use exactly these versions.
+GOVULNCHECK  := go run golang.org/x/vuln/cmd/govulncheck@v1.9.0
+NFPM_VERSION := v2.49.0
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -36,7 +41,7 @@ dist: ## Cross-build stripped static binaries + sha256 for amd64+arm64 into dist
 	done
 
 package: dist ## Build deb+rpm for amd64+arm64 via nfpm (build-time tool; run from repo root)
-	@command -v nfpm >/dev/null 2>&1 || { echo "nfpm not found. Install: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest"; exit 1; }
+	@command -v nfpm >/dev/null 2>&1 || { echo "nfpm not found. Install the pinned version with: make tools"; exit 1; }
 	@mkdir -p $(DIST_DIR)
 	@for arch in $(ARCHES); do \
 		cp $(DIST_DIR)/$(BINARY_NAME)_linux_$$arch $(DIST_DIR)/$(BINARY_NAME).pkgbin; \
@@ -47,6 +52,9 @@ package: dist ## Build deb+rpm for amd64+arm64 via nfpm (build-time tool; run fr
 	done
 	@rm -f $(DIST_DIR)/$(BINARY_NAME).pkgbin
 	@echo ">> artifacts:"; ls -1 $(DIST_DIR)/*.deb $(DIST_DIR)/*.rpm 2>/dev/null || true
+
+tools: ## Install the pinned packaging tool (nfpm) into GOBIN
+	go install github.com/goreleaser/nfpm/v2/cmd/nfpm@$(NFPM_VERSION)
 
 test: ## Run tests
 	go test ./...
@@ -65,6 +73,14 @@ vet: ## Run go vet
 
 lint: ## Run golangci-lint
 	golangci-lint run
+
+vuln: ## Report known vulnerabilities in code the agent calls (govulncheck)
+	$(GOVULNCHECK) ./...
+	cd pkg/wire && $(GOVULNCHECK) ./...
+
+vuln-binary: ## Scan built binaries: make vuln-binary BIN="dist/livck-agent_linux_amd64"
+	@test -n "$(BIN)" || { echo "usage: make vuln-binary BIN=\"<binary> [<binary> ...]\""; exit 2; }
+	@for b in $(BIN); do echo ">> govulncheck $$b"; $(GOVULNCHECK) -mode=binary $$b || exit 1; done
 
 fmt: ## Format the code
 	gofmt -s -w .

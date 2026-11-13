@@ -34,16 +34,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24'
+          # Same source as CI: the release line from .go-version, newest patch.
+          go-version-file: .go-version
+          check-latest: true
           cache: true
           cache-dependency-path: go.sum
 
+      # The version is pinned in the Makefile: a floating @latest would let
+      # whatever nfpm publishes next assemble the packages we sign below.
       - name: Install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+        run: make tools
 
       - name: Resolve version
         id: v
@@ -55,6 +59,12 @@ jobs:
           else
             echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
+
+      # Last gate before anything is built or signed. setup-go has just taken
+      # the newest patch of the release line, so a finding here means a
+      # dependency needs a bump, or Go has no fix out yet.
+      - name: Scan for known vulnerabilities
+        run: make vuln
 
       - name: Build binaries + deb/rpm
         run: make package VERSION=${{ steps.v.outputs.version }}
@@ -74,9 +84,15 @@ jobs:
           done
           echo "== release assets =="; ls -1
 
+      # Stay on cosign v2. From v3 on, sign-blob needs --bundle and writes a
+      # different sidecar, while internal/update/verify.go checks the plain
+      # base64 signature. Moving to v3 is a change to the update path, not a
+      # tool bump.
       - name: Install cosign
         if: github.ref_type == 'tag'
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: 'v2.6.1'
 
       - name: Sign artifacts (cosign, offline key)
         if: github.ref_type == 'tag'

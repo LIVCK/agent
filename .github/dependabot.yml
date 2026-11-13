@@ -1,0 +1,33 @@
+# Dependency updates. A version update waits a week after its release before a
+# pull request is opened, so a bad release has time to be noticed and pulled.
+# Security updates are not delayed.
+version: 2
+updates:
+  # pkg/wire is left out on purpose. It is the frozen contract the ingest side
+  # imports, and its go.mod only moves together with that side.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    ignore:
+      # cosign v3 writes a different signature sidecar than the updater
+      # verifies. See the cosign step in workflows/release.yml.
+      - dependency-name: sigstore/cosign-installer
+        update-types: ["version-update:semver-major"]

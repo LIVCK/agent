@@ -23,12 +23,15 @@ jobs:
         goarch: [amd64, arm64]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24'
+          # .go-version names the release line; check-latest picks its newest
+          # patch on every run, so a Go security release needs no change here.
+          go-version-file: .go-version
+          check-latest: true
           cache: true
           cache-dependency-path: go.sum
 
@@ -44,22 +47,27 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24'
+          # .go-version names the release line; check-latest picks its newest
+          # patch on every run, so a Go security release needs no change here.
+          go-version-file: .go-version
+          check-latest: true
           cache: true
           cache-dependency-path: go.sum
 
       - name: Vet
         run: go vet ./...
 
+      # The prebuilt linter must be built with a Go release at least as new as
+      # the one in .go-version, or it aborts while loading packages.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.12
+          version: v2.15.0
 
       - name: Test (race)
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
@@ -76,13 +84,34 @@ jobs:
             echo "no fuzz targets"
           fi
 
+  vuln:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      # Fails on a known vulnerability in code the agent actually calls: in a
+      # dependency or in the standard library of the Go release built with.
+      - name: govulncheck
+        run: make vuln
+
   scripts:
     name: Served scripts
     runs-on: ubuntu-latest # ships dash (/bin/sh) + shellcheck preinstalled
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The get.livck.cloud-SERVED install.sh (placeholders replaced by the real
       # systemd units) is what customers pipe into `sh` — syntax-check that form,
