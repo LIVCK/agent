@@ -84,6 +84,27 @@ jobs:
             echo "no fuzz targets"
           fi
 
+  vuln:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      # Fails on a known vulnerability in code the agent actually calls: in a
+      # dependency or in the standard library of the Go release built with.
+      - name: govulncheck
+        run: make vuln
+
   scripts:
     name: Served scripts
     runs-on: ubuntu-latest # ships dash (/bin/sh) + shellcheck preinstalled

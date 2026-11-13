@@ -66,6 +66,7 @@ internal/doctor      the doctor command
 make build       # static, stripped binary (CGO disabled)
 make test-race   # tests with the race detector
 make lint        # golangci-lint
+make vuln        # known vulnerabilities in code the agent calls (govulncheck)
 make wire        # build and test the wire module
 ```
 
